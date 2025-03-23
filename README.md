@@ -36,13 +36,13 @@ This dual-phase approach significantly improves forecasting accuracy for intermi
 ## 🛠️ Installation
 
 ```bash
-pip install fh_prevail
+pip install UR2CUTE
 ```
 
 Then import the model:
 
 ```python
-from fh_prevail.models import UR2CUTE
+from UR2CUTE.models import UR2CUTE
 ```
 
 ## 📊 Quick Start
@@ -50,7 +50,7 @@ from fh_prevail.models import UR2CUTE
 ```python
 import pandas as pd
 import torch
-from fh_prevail.models import UR2CUTE
+from UR2CUTE.models import UR2CUTE
 
 # Load time series data
 df = pd.DataFrame({
