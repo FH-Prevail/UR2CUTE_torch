@@ -42,7 +42,7 @@ pip install UR2CUTE
 Then import the model:
 
 ```python
-from UR2CUTE.models import UR2CUTE
+from UR2CUTE import UR2CUTE
 ```
 
 ## 📊 Quick Start
@@ -50,7 +50,7 @@ from UR2CUTE.models import UR2CUTE
 ```python
 import pandas as pd
 import torch
-from UR2CUTE.models import UR2CUTE
+from UR2CUTE import UR2CUTE
 
 # Load time series data
 df = pd.DataFrame({
