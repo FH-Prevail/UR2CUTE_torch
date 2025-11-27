@@ -1,45 +1,40 @@
 # UR2CUTE
 
-**Using Repetitively 2 CNNs for Unsteady Timeseries Estimation**
+Using Repetitively 2 CNNs for Unsteady Timeseries Estimation. UR2CUTE is a dual-stage, PyTorch powered model dedicated to intermittent demand forecasting. A classifier estimates demand occurrence while a regressor predicts magnitude, allowing the library to focus on the sparse structure typical of slow-moving inventory.
 
-UR2CUTE is a specialized forecasting model designed for intermittent time series data. By employing a dual CNN approach with PyTorch, it effectively addresses the challenges of predicting both the occurrence and magnitude of demand in irregular time series patterns.
+## Overview
 
-## 📋 Overview
+Intermittent demand is dominated by long zero stretches punctuated by irregular spikes. Traditional statistical models struggle to capture both the timing and the size of those bursts. UR2CUTE tackles the problem with a hurdle-style architecture:
 
-Intermittent demand forecasting presents unique challenges due to irregular and unpredictable demand patterns, characterized by periods of zero demand followed by random non-zero demand. Traditional forecasting methods often perform poorly on such data.
+1. A CNN classifier predicts the probability of non-zero demand for each step in the forecast horizon.
+2. A CNN regressor estimates the corresponding quantities.
+3. Final forecasts combine the two outputs through an adaptive threshold so the regressor only contributes when demand is likely.
 
-UR2CUTE employs a two-step approach:
-1. A CNN-based classification model predicts demand occurrence (zero vs. non-zero)
-2. A CNN-based regression model estimates the magnitude of demand
+The estimator follows the scikit-learn API, includes thorough input validation, and automatically selects CPU or GPU devices.
 
-This dual-phase approach significantly improves forecasting accuracy for intermittent demand, particularly in predicting periods of zero demand.
+## Features
 
-## 🔍 Features
+- Pure PyTorch implementation with GPU support when available.
+- Direct multi-step forecasting: predicts the entire horizon in a single forward pass.
+- Automatic lag generation plus optional external covariates.
+- Customizable hyperparameters (epochs, batch size, independent learning rates, dropout).
+- Auto-threshold mode that derives an occurrence cutoff from the training set.
+- Early stopping with persistent checkpoints stored in a temporary directory.
+- Reproducible results through explicit random seed management.
+- Model persistence through `save_model` and `load_model`.
+- Complete type hints and packaged type information (`py.typed`).
 
-- **PyTorch Implementation**: Uses PyTorch's efficient tensor operations and GPU acceleration
-- **Two-Step Prediction Process**: Separate models for order occurrence and quantity prediction
-- **Temporal Pattern Recognition**: CNNs effectively capture temporal patterns in intermittent data
-- **Lag Feature Generation**: Automatically creates lagged features to capture historical dependencies
-- **Custom Loss Functions**: Optimized loss functions for each prediction task
-- **Sklearn Compatibility**: Follows scikit-learn API conventions for easy integration
-- **Direct Multi-Step Forecasting**: Predicts multiple future time steps in one pass
-- **Automatic Device Selection**: Utilizes GPU acceleration when available
-- **Model Persistence**: Save and load trained models with `save_model()` and `load_model()`
-- **Auto Threshold**: Automatically compute optimal threshold from training data
-- **Production Ready**: Comprehensive input validation and error handling
-- **Type Hints**: Full type annotation support for better IDE integration
+## Dependencies
 
-## 📦 Dependencies
-
-- Python 3.7+
+- Python 3.7 or newer
 - PyTorch 1.7+
 - NumPy
 - pandas
 - scikit-learn
 
-## 🛠️ Installation
+## Installation
 
-### From PyPI (Recommended)
+### From PyPI
 
 ```bash
 pip install UR2CUTE
@@ -48,242 +43,124 @@ pip install UR2CUTE
 ### From Source
 
 ```bash
-# Clone the repository
 git clone https://github.com/FH-Prevail/UR2CUTE_torch.git
 cd UR2CUTE_torch
-
-# Install in development mode
 pip install -e .
 
-# Or install with optional dependencies
-pip install -e ".[dev]"  # For development
-pip install -e ".[test]"  # For testing
-pip install -e ".[docs]"  # For documentation
+# Optional extras
+pip install -e ".[dev]"
+pip install -e ".[test]"
+pip install -e ".[docs]"
 ```
 
 ### Verify Installation
 
 ```python
 from UR2CUTE import UR2CUTE
-print(UR2CUTE.__module__)  # Should print 'UR2CUTE.model'
+print(UR2CUTE.__module__)
 ```
 
-## 📊 Quick Start
+## Quick Start
 
 ```python
 import pandas as pd
 import torch
 from UR2CUTE import UR2CUTE
 
-# Load time series data
-df = pd.DataFrame({
-    'date': pd.date_range('2023-01-01', periods=50, freq='W'),
-    'target': [0, 5, 0, 0, 12, 0, 0, 0, 7, 0, ...],  # Intermittent data
-    'feat1': [...],  # Optional external features
-    'feat2': [...]   # Optional external features
-})
+data = pd.DataFrame(
+    {
+        "date": pd.date_range("2023-01-01", periods=50, freq="W"),
+        "target": [0, 5, 0, 0, 12, 0, 0, 0, 7, 0] * 5,
+        "promo": [0, 1, 0, 0, 1, 0, 0, 1, 0, 0] * 5,
+        "price": [10.0, 9.5, 9.5, 9.5, 10.0, 10.0, 10.0, 9.8, 9.8, 9.8] * 5,
+    }
+)
 
-# Check for GPU availability
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
 
-# Initialize model
 model = UR2CUTE(
     n_steps_lag=3,
     forecast_horizon=4,
-    external_features=['feat1', 'feat2']
+    external_features=["promo", "price"],
+    threshold="auto",
 )
-
-# Fit model
-model.fit(df, target_col='target')
-
-# Make predictions for the next forecast_horizon steps
-predictions = model.predict(df)
-print("Predicted values:", predictions)
+model.fit(data, target_col="target")
+print(model.predict(data))
 ```
 
-## 🔧 Parameters
+## Parameters
 
-| Parameter                | Description                                                                                                                                   | Default |
-|--------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------|---------|
-| `n_steps_lag`            | Number of lag features to generate                                                                                                            | 3       |
-| `forecast_horizon`       | Number of future steps to predict                                                                                                             | 8       |
-| `external_features`      | List of column names for external features                                                                                                    | None    |
-| `epochs`                 | Training epochs for both CNN models                                                                                                           | 100     |
-| `batch_size`             | Batch size for training                                                                                                                       | 32      |
-| `threshold`              | Probability threshold for classifying zero vs. non-zero. Can be a float or `"auto"` to automatically compute the threshold from training data | 0.5     |
-| `patience`               | Patience for EarlyStopping                                                                                                                    | 10      |
-| `random_seed`            | Random seed for reproducibility                                                                                                               | 42      |
-| `classification_lr`      | Learning rate for classification model                                                                                                        | 0.0021  |
-| `regression_lr`          | Learning rate for regression model                                                                                                            | 0.0021  |
-| `dropout_classification` | Dropout rate for classification model                                                                                                         | 0.4     |
-| `dropout_regression`     | Dropout rate for regression model                                                                                                             | 0.2     |
-| `verbose`                | Whether to print training progress                                                                                                            | True    |
+| Parameter | Description | Default |
+| --- | --- | --- |
+| `n_steps_lag` | Number of lag features to generate. | 3 |
+| `forecast_horizon` | Number of future periods predicted per call. | 8 |
+| `external_features` | Optional list of column names used as exogenous inputs. | `None` |
+| `epochs` | Training epochs for both CNN models. | 100 |
+| `batch_size` | Training batch size. | 32 |
+| `threshold` | Manual probability threshold or `"auto"` to derive from training data. | 0.5 |
+| `patience` | Early stopping patience (epochs). | 10 |
+| `random_seed` | Global random seed applied to NumPy, Python, and PyTorch. | 42 |
+| `classification_lr` | Learning rate for the classifier. | 0.0021 |
+| `regression_lr` | Learning rate for the regressor. | 0.0021 |
+| `dropout_classification` | Dropout applied inside the classifier. | 0.4 |
+| `dropout_regression` | Dropout applied inside the regressor. | 0.2 |
+| `verbose` | Enables progress output and early-stopping logs. | `True` |
 
-## 📝 Methods
-
-### fit(df, target_col)
-
-Fits the UR2CUTE model on the time series data.
-
-**Parameters:**
-- `df` (pandas.DataFrame): Time series data with at least the target column. Must be sorted by time.
-- `target_col` (str): The name of the column to forecast.
-
-**Returns:**
-- The fitted UR2CUTE model instance.
-
-### predict(df)
-
-Predicts the next `forecast_horizon` steps from the input DataFrame.
-
-**Parameters:**
-- `df` (pandas.DataFrame): Time series data with the same columns as used in fit(). Must be sorted by time.
-
-**Returns:**
-- numpy.ndarray: The predictions for each step in the horizon.
-
-### save_model(path)
-
-Save the trained model to disk for later use.
-
-**Parameters:**
-- `path` (str): Path where the model should be saved (e.g., 'my_model.pkl')
-
-**Example:**
-```python
-model.fit(df, 'target')
-model.save_model('ur2cute_model.pkl')
-```
-
-### load_model(path) [classmethod]
-
-Load a previously saved model from disk.
-
-**Parameters:**
-- `path` (str): Path to the saved model file
-
-**Returns:**
-- UR2CUTE: A loaded model instance ready for prediction
-
-**Example:**
-```python
-model = UR2CUTE.load_model('ur2cute_model.pkl')
-predictions = model.predict(new_data)
-```
-
-## 🚀 Advanced Usage
+## Usage Patterns
 
 ### Auto Threshold
 
-Let the model automatically compute the optimal threshold based on your training data:
+```python
+model = UR2CUTE(threshold="auto")
+model.fit(df, "target")
+print(model.threshold_)
+```
+
+### External Features
 
 ```python
-model = UR2CUTE(
-    n_steps_lag=3,
-    forecast_horizon=4,
-    threshold='auto'  # Automatically computed from training data
-)
-model.fit(df, 'target')
-# The computed threshold is stored in model.threshold_
-print(f"Computed threshold: {model.threshold_}")
+covariates = ["promotion", "price", "weekday"]
+model = UR2CUTE(external_features=covariates)
+model.fit(df, "target")
 ```
 
 ### Silent Training
 
-Disable training output for production environments:
-
 ```python
-model = UR2CUTE(
-    n_steps_lag=3,
-    forecast_horizon=4,
-    verbose=False  # No training output
-)
-model.fit(df, 'target')
+model = UR2CUTE(verbose=False)
+model.fit(df, "target")
 ```
 
-### Model Persistence Workflow
-
-Save and deploy models in production:
+### Model Persistence
 
 ```python
-# Training phase
-model = UR2CUTE(n_steps_lag=3, forecast_horizon=4)
-model.fit(train_df, 'target')
-model.save_model('production_model.pkl')
+trained = UR2CUTE().fit(train_df, "target")
+trained.save_model("production_model.pkl")
 
-# Deployment phase (different script/server)
-from UR2CUTE import UR2CUTE
-model = UR2CUTE.load_model('production_model.pkl')
-predictions = model.predict(new_data)
+loaded = UR2CUTE.load_model("production_model.pkl")
+preds = loaded.predict(new_df)
 ```
 
-### Using External Features
+## How It Works
 
-Include additional predictive features:
+1. **Preprocessing** – validates the input frame, generates lag features, creates multi-step samples, and splits chronologically into train and validation partitions.
+2. **Scaling** – fits separate MinMax scalers on the training set and applies them to validation and inference data, preventing validation leakage.
+3. **Classification Stage** – trains a CNN with sigmoid output and BCE loss to estimate the probability of demand for each future horizon step.
+4. **Regression Stage** – trains a CNN regressor with MSE loss on samples that exhibit demand; if no such sequences exist, the model safely falls back to the full dataset.
+5. **Inference** – transforms the latest observed sequence, runs both networks, rescales quantities, and zeros out forecasts whose probability falls below the stored threshold.
 
-```python
-df = pd.DataFrame({
-    'target': [...],
-    'promotion': [0, 1, 0, 1, ...],  # Promotional events
-    'price': [10.5, 9.99, 10.5, ...],  # Price changes
-    'day_of_week': [1, 2, 3, 4, ...]  # Temporal features
-})
+## Performance
 
-model = UR2CUTE(
-    n_steps_lag=3,
-    forecast_horizon=4,
-    external_features=['promotion', 'price', 'day_of_week']
-)
-model.fit(df, 'target')
-```
+Internal benchmarks show UR2CUTE outperforming Croston, AutoARIMA, Prophet, gradient boosted trees, and random forests on sparse demand series, especially in MAE% and RMSE%. Improvements stem from the dedicated occurrence model, lagged covariates, and the ability to learn temporal filters tuned to each dataset.
 
-## 🔍 How It Works
-
-1. **Data Preprocessing**:
-   - Aggregates demand data (e.g., daily to weekly)
-   - Generates lag features to capture historical patterns
-   - Validates input data for quality and completeness
-
-2. **Model Architecture**:
-   - **Classification Model**: CNN architecture with convolutional layers, max pooling, and dropout
-   - **Regression Model**: Similar CNN architecture optimized for quantity prediction
-
-3. **Training Process**:
-   - Models are trained using PyTorch's DataLoader for efficient batch processing
-   - Early stopping prevents overfitting by monitoring validation loss
-   - Uses Adam optimizer with customizable learning rates
-   - Temporary checkpoints are automatically cleaned up
-
-4. **Prediction Process**:
-   - Classification model predicts if demand will occur (probability > threshold)
-   - Regression model predicts the magnitude of demand
-   - Final prediction combines both models' outputs
-
-## 🏆 Performance
-
-UR2CUTE outperforms traditional forecasting techniques including:
-- Croston's method
-- XGBoost
-- Random Forest
-- ETR
-- Prophet
-- AutoARIMA
-
-Particularly for predicting intermittent demand, UR2CUTE shows significant improvements in:
-- Mean Absolute Error % (MAE%)
-- Root Mean Square Error % (RMSE%)
-- R-squared values
-
-## 📚 Citation
-
-If you use UR2CUTE in your research, please cite:
+## Citation
 
 ```
 @article{mirshahi2024intermittent,
   title={Intermittent Time Series Demand Forecasting Using Dual Convolutional Neural Networks},
-  author={Mirshahi, Sina and Brandtner, Patrick and Kom{\'i}nkov{\'a} Oplatkov{\'a}, Zuzana},
-  journal={MENDEL — Soft Computing Journal},
+  author={Mirshahi, Sina and Brandtner, Patrick and Kominkova Oplatkova, Zuzana},
+  journal={MENDEL -- Soft Computing Journal},
   volume={30},
   number={1},
   year={2024},
@@ -291,22 +168,23 @@ If you use UR2CUTE in your research, please cite:
 }
 ```
 
-## 📄 License
+## License
 
-This project is licensed under the MIT License - see the LICENSE file for details.
+UR2CUTE is released under the MIT License. See `LICENSE` for the full text.
 
-## 👥 Contributors
+## Contributors
 
 - Sina Mirshahi
 - Patrick Brandtner
-- Zuzana Komínková Oplatková
+- Zuzana Kominkova Oplatkova
 - Taha Falatouri
 - Mehran Naseri
 - Farzaneh Darbanian
 
-## 🙏 Acknowledgments
+## Acknowledgments
 
-This research was conducted at:
-- Department of Informatics and Artificial Intelligence, Tomas Bata
+This work was carried out at:
+
+- Department of Informatics and Artificial Intelligence, Tomas Bata University
 - Department for Logistics, University of Applied Sciences Upper Austria, Steyr
 - Josef Ressel-Centre for Predictive Value Network Intelligence, Steyr

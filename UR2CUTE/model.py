@@ -473,6 +473,68 @@ class UR2CUTE(BaseEstimator):
                         f"Please handle missing values before fitting."
                     )
 
+    def _validate_predict_data(self, df: pd.DataFrame) -> None:
+        """
+        Validate input data for predict method.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Input dataframe to validate
+
+        Raises
+        ------
+        ValueError
+            If validation fails
+        """
+        # Check if DataFrame is empty
+        if df.empty:
+            raise ValueError("Input DataFrame is empty")
+
+        # Check minimum data length for prediction (need at least n_steps_lag rows)
+        min_required_length = self.n_steps_lag
+        if len(df) < min_required_length:
+            raise ValueError(
+                f"Insufficient data for prediction: need at least {min_required_length} rows "
+                f"(n_steps_lag={self.n_steps_lag}), but got {len(df)} rows"
+            )
+
+        # Check if target column exists
+        if self.target_col_ not in df.columns:
+            raise ValueError(
+                f"Target column '{self.target_col_}' not found in DataFrame. "
+                f"Available columns: {list(df.columns)}"
+            )
+
+        # Check if external features exist
+        if self.external_features:
+            missing_features = [f for f in self.external_features if f not in df.columns]
+            if missing_features:
+                raise ValueError(
+                    f"External features {missing_features} not found in DataFrame. "
+                    f"Available columns: {list(df.columns)}"
+                )
+
+        # Check for NaN values in the last n_steps_lag rows of target column
+        # (these are the ones we'll use for lag features)
+        target_values = df[self.target_col_].tail(self.n_steps_lag)
+        if target_values.isna().any():
+            raise ValueError(
+                f"Target column '{self.target_col_}' contains NaN values in the last "
+                f"{self.n_steps_lag} rows needed for lag features. "
+                f"Please handle missing values before prediction."
+            )
+
+        # Check for NaN values in the last row of external features
+        if self.external_features:
+            last_row = df[self.external_features].iloc[-1]
+            if last_row.isna().any():
+                nan_features = last_row[last_row.isna()].index.tolist()
+                raise ValueError(
+                    f"External features {nan_features} contain NaN values in the last row. "
+                    f"Please handle missing values before prediction."
+                )
+
     def fit(self, df: pd.DataFrame, target_col: str) -> 'UR2CUTE':
         """
         Fit the UR2CUTE model on a time-series dataframe `df`.
@@ -527,29 +589,43 @@ class UR2CUTE(BaseEstimator):
                 self.forecast_horizon
             )
             # shape: X_all -> (samples, features), y_all -> (samples, forecast_horizon)
+            n_sequences = X_all.shape[0]
+            if n_sequences == 0:
+                raise ValueError(
+                    "Not enough usable sequences after generating lag features. "
+                    "Increase the size of your dataset or reduce n_steps_lag/forecast_horizon."
+                )
 
-            # 3) Scale inputs
-            self.scaler_X_ = MinMaxScaler()
-            X_scaled = self.scaler_X_.fit_transform(X_all)
-
-            self.scaler_y_ = MinMaxScaler()
-            y_flat = y_all.flatten().reshape(-1, 1)
-            self.scaler_y_.fit(y_flat)
-            y_scaled = self.scaler_y_.transform(y_flat).reshape(y_all.shape)
-
-            # For CNN, we want (samples, features, 1)
-            X_reshaped = X_scaled.reshape((X_scaled.shape[0], X_scaled.shape[1], 1))
-            self.n_features_ = X_reshaped.shape[1]
-
-            # 4) Time-based split for validation (10%)
-            val_split_idx = int(len(X_reshaped) * 0.9)
-            X_train = X_reshaped[:val_split_idx]
+            # Time-based split for validation (10%)
+            val_split_idx = int(n_sequences * 0.9)
+            X_train_raw = X_all[:val_split_idx]
             y_train = y_all[:val_split_idx]
-            X_val = X_reshaped[val_split_idx:]
+            X_val_raw = X_all[val_split_idx:]
             y_val = y_all[val_split_idx:]
 
-            y_train_scaled = y_scaled[:val_split_idx]
-            y_val_scaled = y_scaled[val_split_idx:]
+            # Ensure both splits contain at least one sequence
+            if len(X_train_raw) == 0:
+                X_train_raw = X_all
+                y_train = y_all
+            if len(X_val_raw) == 0:
+                X_val_raw = X_train_raw.copy()
+                y_val = y_train.copy()
+
+            # 3) Scale inputs using training data statistics only
+            self.scaler_X_ = MinMaxScaler()
+            X_train_scaled = self.scaler_X_.fit_transform(X_train_raw)
+            X_val_scaled = self.scaler_X_.transform(X_val_raw)
+
+            self.scaler_y_ = MinMaxScaler()
+            y_train_flat = y_train.flatten().reshape(-1, 1)
+            self.scaler_y_.fit(y_train_flat)
+            y_train_scaled = self.scaler_y_.transform(y_train_flat).reshape(y_train.shape)
+            y_val_scaled = self.scaler_y_.transform(y_val.flatten().reshape(-1, 1)).reshape(y_val.shape)
+
+            # For CNN, we want (samples, features, 1)
+            X_train = X_train_scaled.reshape((X_train_scaled.shape[0], X_train_scaled.shape[1], 1))
+            X_val = X_val_scaled.reshape((X_val_scaled.shape[0], X_val_scaled.shape[1], 1))
+            self.n_features_ = X_train.shape[1]
 
             # Auto threshold: if threshold is set to "auto", calculate it and store as threshold_
             if isinstance(self.threshold, str) and self.threshold.lower() == "auto":
@@ -578,11 +654,24 @@ class UR2CUTE(BaseEstimator):
             nonzero_mask_train = (y_train.sum(axis=1) > 0)
             nonzero_mask_val = (y_val.sum(axis=1) > 0)
 
-            X_train_reg = X_train[nonzero_mask_train]
-            y_train_reg = y_train_scaled[nonzero_mask_train]
+            if not np.any(nonzero_mask_train):
+                if self.verbose:
+                    print(
+                        "No non-zero horizons found in training data; "
+                        "training regressor on the full dataset."
+                    )
+                X_train_reg = X_train
+                y_train_reg = y_train_scaled
+            else:
+                X_train_reg = X_train[nonzero_mask_train]
+                y_train_reg = y_train_scaled[nonzero_mask_train]
 
-            X_val_reg = X_val[nonzero_mask_val]
-            y_val_reg = y_val_scaled[nonzero_mask_val]
+            if not np.any(nonzero_mask_val):
+                X_val_reg = X_val
+                y_val_reg = y_val_scaled
+            else:
+                X_val_reg = X_val[nonzero_mask_val]
+                y_val_reg = y_val_scaled[nonzero_mask_val]
 
             self._train_regressor(X_train_reg, y_train_reg, X_val_reg, y_val_reg)
 
@@ -618,12 +707,17 @@ class UR2CUTE(BaseEstimator):
         ------
         RuntimeError
             If the model has not been fitted yet or if prediction fails.
+        ValueError
+            If input data validation fails.
         """
         # Check if model has been fitted
         if self.classifier_ is None or self.regressor_ is None:
             raise RuntimeError(
                 "Model has not been fitted yet. Call fit() before predict()."
             )
+
+        # Validate input data
+        self._validate_predict_data(df)
 
         try:
             target_col = self.target_col_
@@ -729,6 +823,16 @@ class UR2CUTE(BaseEstimator):
             )
 
         try:
+            # Move state dicts to CPU to keep the saved artifact loadable on CPU-only machines
+            classifier_state_cpu = {
+                k: v.cpu() if isinstance(v, torch.Tensor) else v
+                for k, v in self.classifier_.state_dict().items()
+            }
+            regressor_state_cpu = {
+                k: v.cpu() if isinstance(v, torch.Tensor) else v
+                for k, v in self.regressor_.state_dict().items()
+            }
+
             model_data = {
                 # Hyperparameters
                 'n_steps_lag': self.n_steps_lag,
@@ -749,8 +853,8 @@ class UR2CUTE(BaseEstimator):
                 'n_features_': self.n_features_,
                 'threshold_': self.threshold_,
                 # Model state dicts
-                'classifier_state_dict': self.classifier_.state_dict(),
-                'regressor_state_dict': self.regressor_.state_dict(),
+                'classifier_state_dict': classifier_state_cpu,
+                'regressor_state_dict': regressor_state_cpu,
                 # Scalers
                 'scaler_X_': self.scaler_X_,
                 'scaler_y_': self.scaler_y_,
@@ -830,9 +934,15 @@ class UR2CUTE(BaseEstimator):
                 dropout_rate=model.dropout_regression
             ).to(model.device)
 
-            # Load model weights
-            model.classifier_.load_state_dict(model_data['classifier_state_dict'])
-            model.regressor_.load_state_dict(model_data['regressor_state_dict'])
+            # Load model weights with device mapping for GPU→CPU compatibility
+            # Convert state dicts to current device to handle GPU→CPU or CPU→GPU transfers
+            classifier_state = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+                              for k, v in model_data['classifier_state_dict'].items()}
+            regressor_state = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v
+                             for k, v in model_data['regressor_state_dict'].items()}
+
+            model.classifier_.load_state_dict(classifier_state)
+            model.regressor_.load_state_dict(regressor_state)
 
             # Set models to eval mode
             model.classifier_.eval()
