@@ -1,8 +1,7 @@
 import os
 import random
-import tempfile
-import shutil
 import pickle
+import copy
 from typing import List, Optional, Union
 import numpy as np
 import pandas as pd
@@ -58,6 +57,37 @@ def _create_multistep_data(df, target_name, external_features, n_steps_lag, fore
     return np.array(X_list), np.array(y_list)
 
 
+def _split_train_validation_sequences(X_all, y_all, forecast_horizon, val_fraction=0.1):
+    """
+    Split windows chronologically without letting train and validation targets overlap.
+
+    Validation windows are taken from the tail of the series, while an embargo of
+    `forecast_horizon - 1` windows is left between train and validation samples.
+    If the dataset is too small to support a leakage-free split, fall back to
+    using the full dataset for both train and validation.
+    """
+    n_sequences = X_all.shape[0]
+    if n_sequences < 2:
+        return X_all, y_all, X_all.copy(), y_all.copy()
+
+    n_val = max(1, int(np.ceil(n_sequences * val_fraction)))
+    val_start = n_sequences - n_val
+    train_end = val_start - forecast_horizon + 1
+
+    if train_end <= 0 or val_start >= n_sequences:
+        return X_all, y_all, X_all.copy(), y_all.copy()
+
+    X_train = X_all[:train_end]
+    y_train = y_all[:train_end]
+    X_val = X_all[val_start:]
+    y_val = y_all[val_start:]
+
+    if len(X_train) == 0 or len(X_val) == 0:
+        return X_all, y_all, X_all.copy(), y_all.copy()
+
+    return X_train, y_train, X_val, y_val
+
+
 class CNNClassifier(nn.Module):
     """
     PyTorch CNN model for classification (zero vs. nonzero)
@@ -66,14 +96,12 @@ class CNNClassifier(nn.Module):
         super(CNNClassifier, self).__init__()
         self.conv1 = nn.Conv1d(1, 64, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool1d(kernel_size=2)
+        pooled_size = max(1, n_features // 2)
+        self.pool = nn.AdaptiveMaxPool1d(pooled_size)
         self.dropout = nn.Dropout(dropout_rate)
         self.flatten = nn.Flatten()
 
-        # Calculate size after pooling correctly (handles odd n_features)
-        # Conv1d with padding=1 preserves size, MaxPool1d with kernel=2 does floor division
-        size_after_pool = n_features // 2
-        flattened_size = 64 * size_after_pool
+        flattened_size = 64 * pooled_size
 
         self.fc1 = nn.Linear(flattened_size, 32)
         self.fc2 = nn.Linear(32, forecast_horizon)
@@ -101,14 +129,12 @@ class CNNRegressor(nn.Module):
         super(CNNRegressor, self).__init__()
         self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
         self.conv2 = nn.Conv1d(32, 32, kernel_size=3, padding=1)
-        self.pool = nn.MaxPool1d(kernel_size=2)
+        pooled_size = max(1, n_features // 2)
+        self.pool = nn.AdaptiveMaxPool1d(pooled_size)
         self.dropout = nn.Dropout(dropout_rate)
         self.flatten = nn.Flatten()
 
-        # Calculate size after pooling correctly (handles odd n_features)
-        # Conv1d with padding=1 preserves size, MaxPool1d with kernel=2 does floor division
-        size_after_pool = n_features // 2
-        flattened_size = 32 * size_after_pool
+        flattened_size = 32 * pooled_size
 
         self.fc1 = nn.Linear(flattened_size, 46)
         self.fc2 = nn.Linear(46, forecast_horizon)
@@ -136,6 +162,7 @@ class EarlyStopping:
         self.verbose = verbose
         self.counter = 0
         self.best_score = None
+        self.best_state_dict = None
         self.early_stop = False
         self.val_loss_min = np.inf  # Changed from np.Inf to np.inf for NumPy 2.0 compatibility
         self.delta = delta
@@ -161,8 +188,21 @@ class EarlyStopping:
     def save_checkpoint(self, val_loss, model):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
-        torch.save(model.state_dict(), self.path)
+        self.best_state_dict = {
+            key: value.detach().cpu().clone() if torch.is_tensor(value) else copy.deepcopy(value)
+            for key, value in model.state_dict().items()
+        }
         self.val_loss_min = val_loss
+
+    def restore_best_weights(self, model, device):
+        if self.best_state_dict is None:
+            raise RuntimeError("Early stopping did not capture any model weights.")
+
+        state_dict = {
+            key: value.to(device) if torch.is_tensor(value) else copy.deepcopy(value)
+            for key, value in self.best_state_dict.items()
+        }
+        model.load_state_dict(state_dict)
 
 
 class UR2CUTE(BaseEstimator):
@@ -201,6 +241,10 @@ class UR2CUTE(BaseEstimator):
         Dropout rate for the classification model.
     dropout_regression : float
         Dropout rate for the regression model.
+    regressor_nonzero_only : bool
+        If True (default), the regressor is trained only on sequences where the horizon
+        contains at least one non-zero value. Set to False to train the regressor on all
+        sequences regardless of demand occurrence.
     verbose : bool
         Whether to print training progress. Default is True.
     """
@@ -219,6 +263,7 @@ class UR2CUTE(BaseEstimator):
         regression_lr=0.0021,
         dropout_classification=0.4,
         dropout_regression=0.2,
+        regressor_nonzero_only=True,
         verbose=True
     ):
         self.n_steps_lag = n_steps_lag
@@ -233,6 +278,7 @@ class UR2CUTE(BaseEstimator):
         self.regression_lr = regression_lr
         self.dropout_classification = dropout_classification
         self.dropout_regression = dropout_regression
+        self.regressor_nonzero_only = regressor_nonzero_only
         self.verbose = verbose
 
         # Set device (cuda if available, else cpu)
@@ -248,8 +294,6 @@ class UR2CUTE(BaseEstimator):
         self.n_features_ = None
         # Fitted threshold (for auto threshold computation)
         self.threshold_ = None
-        # Temporary directory for checkpoints
-        self._temp_dir = None
 
     def _set_random_seeds(self):
         """
@@ -291,12 +335,9 @@ class UR2CUTE(BaseEstimator):
         optimizer = optim.Adam(self.classifier_.parameters(), lr=self.classification_lr)
         criterion = nn.BCELoss()
 
-        # Early stopping with unique checkpoint path
-        classifier_checkpoint_path = os.path.join(self._temp_dir, 'classifier_checkpoint.pt')
         early_stopping = EarlyStopping(
             patience=self.patience,
-            verbose=self.verbose,
-            path=classifier_checkpoint_path
+            verbose=self.verbose
         )
 
         # Training loop
@@ -336,11 +377,7 @@ class UR2CUTE(BaseEstimator):
                     print("Early stopping")
                 break
 
-        # Load the best model with error handling
-        try:
-            self.classifier_.load_state_dict(torch.load(classifier_checkpoint_path))
-        except Exception as e:
-            raise RuntimeError(f"Failed to load classifier checkpoint: {e}")
+        early_stopping.restore_best_weights(self.classifier_, self.device)
         
     def _train_regressor(self, X_train, y_train, X_val, y_val):
         """
@@ -367,12 +404,9 @@ class UR2CUTE(BaseEstimator):
         optimizer = optim.Adam(self.regressor_.parameters(), lr=self.regression_lr)
         criterion = nn.MSELoss()
 
-        # Early stopping with unique checkpoint path
-        regressor_checkpoint_path = os.path.join(self._temp_dir, 'regressor_checkpoint.pt')
         early_stopping = EarlyStopping(
             patience=self.patience,
-            verbose=self.verbose,
-            path=regressor_checkpoint_path
+            verbose=self.verbose
         )
 
         # Training loop
@@ -406,11 +440,7 @@ class UR2CUTE(BaseEstimator):
                     print("Early stopping")
                 break
 
-        # Load the best model with error handling
-        try:
-            self.regressor_.load_state_dict(torch.load(regressor_checkpoint_path))
-        except Exception as e:
-            raise RuntimeError(f"Failed to load regressor checkpoint: {e}")
+        early_stopping.restore_best_weights(self.regressor_, self.device)
 
     def _validate_input_data(self, df: pd.DataFrame, target_col: str) -> None:
         """
@@ -569,88 +599,76 @@ class UR2CUTE(BaseEstimator):
 
         self._set_random_seeds()
         self.target_col_ = target_col
+        # 1) Generate lag features & drop NaNs (work on copy to avoid modifying input)
+        df_copy = df.copy()
+        df_lagged = _generate_lag_features(df_copy, target_col, n_lags=self.n_steps_lag)
+        df_lagged.dropna(inplace=True)
+        df_lagged.reset_index(drop=True, inplace=True)
 
-        # Create temporary directory for checkpoints
-        self._temp_dir = tempfile.mkdtemp()
-
-        try:
-            # 1) Generate lag features & drop NaNs (work on copy to avoid modifying input)
-            df_copy = df.copy()
-            df_lagged = _generate_lag_features(df_copy, target_col, n_lags=self.n_steps_lag)
-            df_lagged.dropna(inplace=True)
-            df_lagged.reset_index(drop=True, inplace=True)
-
-            # 2) Create multi-step training data
-            X_all, y_all = _create_multistep_data(
-                df_lagged,
-                target_col,
-                self.external_features,
-                self.n_steps_lag,
-                self.forecast_horizon
+        # 2) Create multi-step training data
+        X_all, y_all = _create_multistep_data(
+            df_lagged,
+            target_col,
+            self.external_features,
+            self.n_steps_lag,
+            self.forecast_horizon
+        )
+        # shape: X_all -> (samples, features), y_all -> (samples, forecast_horizon)
+        n_sequences = X_all.shape[0]
+        if n_sequences == 0:
+            raise ValueError(
+                "Not enough usable sequences after generating lag features. "
+                "Increase the size of your dataset or reduce n_steps_lag/forecast_horizon."
             )
-            # shape: X_all -> (samples, features), y_all -> (samples, forecast_horizon)
-            n_sequences = X_all.shape[0]
-            if n_sequences == 0:
-                raise ValueError(
-                    "Not enough usable sequences after generating lag features. "
-                    "Increase the size of your dataset or reduce n_steps_lag/forecast_horizon."
-                )
 
-            # Time-based split for validation (10%)
-            val_split_idx = int(n_sequences * 0.9)
-            X_train_raw = X_all[:val_split_idx]
-            y_train = y_all[:val_split_idx]
-            X_val_raw = X_all[val_split_idx:]
-            y_val = y_all[val_split_idx:]
+        # Keep the validation tail chronologically separate from train targets.
+        X_train_raw, y_train, X_val_raw, y_val = _split_train_validation_sequences(
+            X_all,
+            y_all,
+            self.forecast_horizon
+        )
 
-            # Ensure both splits contain at least one sequence
-            if len(X_train_raw) == 0:
-                X_train_raw = X_all
-                y_train = y_all
-            if len(X_val_raw) == 0:
-                X_val_raw = X_train_raw.copy()
-                y_val = y_train.copy()
+        # 3) Scale inputs using training data statistics only
+        self.scaler_X_ = MinMaxScaler()
+        X_train_scaled = self.scaler_X_.fit_transform(X_train_raw)
+        X_val_scaled = self.scaler_X_.transform(X_val_raw)
 
-            # 3) Scale inputs using training data statistics only
-            self.scaler_X_ = MinMaxScaler()
-            X_train_scaled = self.scaler_X_.fit_transform(X_train_raw)
-            X_val_scaled = self.scaler_X_.transform(X_val_raw)
+        self.scaler_y_ = MinMaxScaler()
+        y_train_flat = y_train.flatten().reshape(-1, 1)
+        self.scaler_y_.fit(y_train_flat)
+        y_train_scaled = self.scaler_y_.transform(y_train_flat).reshape(y_train.shape)
+        y_val_scaled = self.scaler_y_.transform(y_val.flatten().reshape(-1, 1)).reshape(y_val.shape)
 
-            self.scaler_y_ = MinMaxScaler()
-            y_train_flat = y_train.flatten().reshape(-1, 1)
-            self.scaler_y_.fit(y_train_flat)
-            y_train_scaled = self.scaler_y_.transform(y_train_flat).reshape(y_train.shape)
-            y_val_scaled = self.scaler_y_.transform(y_val.flatten().reshape(-1, 1)).reshape(y_val.shape)
+        # For CNN, we want (samples, features, 1)
+        X_train = X_train_scaled.reshape((X_train_scaled.shape[0], X_train_scaled.shape[1], 1))
+        X_val = X_val_scaled.reshape((X_val_scaled.shape[0], X_val_scaled.shape[1], 1))
+        self.n_features_ = X_train.shape[1]
 
-            # For CNN, we want (samples, features, 1)
-            X_train = X_train_scaled.reshape((X_train_scaled.shape[0], X_train_scaled.shape[1], 1))
-            X_val = X_val_scaled.reshape((X_val_scaled.shape[0], X_val_scaled.shape[1], 1))
-            self.n_features_ = X_train.shape[1]
+        # Auto threshold: if threshold is set to "auto", calculate it and store as threshold_
+        if isinstance(self.threshold, str) and self.threshold.lower() == "auto":
+            self.threshold_ = round(np.mean(y_train == 0), 2)
+            if self.verbose:
+                print(f"Auto threshold set to: {self.threshold_}")
+        else:
+            # Use the provided threshold value
+            self.threshold_ = self.threshold
 
-            # Auto threshold: if threshold is set to "auto", calculate it and store as threshold_
-            if isinstance(self.threshold, str) and self.threshold.lower() == "auto":
-                self.threshold_ = round(np.mean(y_train == 0), 2)
-                if self.verbose:
-                    print(f"Auto threshold set to: {self.threshold_}")
-            else:
-                # Use the provided threshold value
-                self.threshold_ = self.threshold
+        # Classification target: zero vs. nonzero
+        y_train_binary = (y_train > 0).astype(float)  # shape: (samples, horizon)
+        y_val_binary = (y_val > 0).astype(float)
 
-            # Classification target: zero vs. nonzero
-            y_train_binary = (y_train > 0).astype(float)  # shape: (samples, horizon)
-            y_val_binary = (y_val > 0).astype(float)
+        # --------------------------
+        # Train Classification Model
+        # --------------------------
+        self._train_classifier(X_train, y_train_binary, X_val, y_val_binary)
 
-            # --------------------------
-            # Train Classification Model
-            # --------------------------
-            self._train_classifier(X_train, y_train_binary, X_val, y_val_binary)
-
-            # -----------------------
-            # Train Regression Model
-            # Train only on samples that have at least one nonzero step in the horizon
-            # OR you can filter for sum > 0, or for any > 0, etc.
-            # We'll use sum > 0 here.
-            # -----------------------
+        # -----------------------
+        # Train Regression Model
+        # When regressor_nonzero_only=True (default), train only on samples that have
+        # at least one nonzero step in the horizon. Falls back to full dataset if no
+        # such samples exist. When False, train on all samples.
+        # -----------------------
+        if self.regressor_nonzero_only:
             nonzero_mask_train = (y_train.sum(axis=1) > 0)
             nonzero_mask_val = (y_val.sum(axis=1) > 0)
 
@@ -672,14 +690,13 @@ class UR2CUTE(BaseEstimator):
             else:
                 X_val_reg = X_val[nonzero_mask_val]
                 y_val_reg = y_val_scaled[nonzero_mask_val]
+        else:
+            X_train_reg = X_train
+            y_train_reg = y_train_scaled
+            X_val_reg = X_val
+            y_val_reg = y_val_scaled
 
-            self._train_regressor(X_train_reg, y_train_reg, X_val_reg, y_val_reg)
-
-        finally:
-            # Clean up temporary directory
-            if self._temp_dir and os.path.exists(self._temp_dir):
-                shutil.rmtree(self._temp_dir)
-                self._temp_dir = None
+        self._train_regressor(X_train_reg, y_train_reg, X_val_reg, y_val_reg)
 
         return self
 

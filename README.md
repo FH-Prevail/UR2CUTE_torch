@@ -105,6 +105,7 @@ print(model.predict(data))
 | `regression_lr` | Learning rate for the regressor. | 0.0021 |
 | `dropout_classification` | Dropout applied inside the classifier. | 0.4 |
 | `dropout_regression` | Dropout applied inside the regressor. | 0.2 |
+| `regressor_nonzero_only` | When `True`, the regressor is trained only on sequences where the forecast horizon contains at least one non-zero value. Set to `False` to train the regressor on all sequences. | `True` |
 | `verbose` | Enables progress output and early-stopping logs. | `True` |
 
 ## Usage Patterns
@@ -147,7 +148,7 @@ preds = loaded.predict(new_df)
 1. **Preprocessing** – validates the input frame, generates lag features, creates multi-step samples, and splits chronologically into train and validation partitions.
 2. **Scaling** – fits separate MinMax scalers on the training set and applies them to validation and inference data, preventing validation leakage.
 3. **Classification Stage** – trains a CNN with sigmoid output and BCE loss to estimate the probability of demand for each future horizon step.
-4. **Regression Stage** – trains a CNN regressor with MSE loss on samples that exhibit demand; if no such sequences exist, the model safely falls back to the full dataset.
+4. **Regression Stage** – trains a CNN regressor with MSE loss. By default (`regressor_nonzero_only=True`) only sequences where the horizon contains at least one non-zero value are used, keeping the regressor focused on demand magnitude; if no such sequences exist it falls back to the full dataset. Set `regressor_nonzero_only=False` to train the regressor on all sequences instead.
 5. **Inference** – transforms the latest observed sequence, runs both networks, rescales quantities, and zeros out forecasts whose probability falls below the stored threshold.
 
 ## Performance
