@@ -7,54 +7,84 @@ import numpy as np
 import pandas as pd
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+from numpy.lib.stride_tricks import sliding_window_view
 
 from sklearn.base import BaseEstimator
-from sklearn.preprocessing import MinMaxScaler
 
 
-def _combined_loss(alpha=0.5):
+# Internal column names for engineered intermittent-demand channels.
+_TSL_COL = "__time_since_last__"
+_ROLLMEAN_COL = "__rolling_mean__"
+
+
+def _build_feature_frame(df, target_col, external_features, window):
     """
-    Custom loss function combining MSE and MAE.
+    Build the multichannel feature matrix that feeds the CNNs.
+
+    Returns an array of shape (T, C) where the columns (channels) are, in order:
+        [target, *external_features, time-since-last-nonzero, rolling-mean]
+
+    The target and external features are passed through as raw time series; the
+    last two channels are causal intermittent-demand features computed only from
+    information available up to and including each row (no look-ahead leakage).
     """
-    def loss(y_true, y_pred):
-        mse = torch.mean(torch.square(y_true - y_pred))
-        mae = torch.mean(torch.abs(y_true - y_pred))
-        return alpha * mse + (1 - alpha) * mae
-    return loss
+    external_features = external_features or []
+    demand = df[target_col].to_numpy(dtype=float)
+
+    # Time since the most recent non-zero demand (a core intermittency signal).
+    tsl = np.empty(len(demand), dtype=float)
+    last_nonzero = -1
+    for i, value in enumerate(demand):
+        if value > 0:
+            tsl[i] = 0.0
+            last_nonzero = i
+        else:
+            tsl[i] = (i - last_nonzero) if last_nonzero >= 0 else (i + 1)
+
+    # Causal rolling mean of demand over the lookback window.
+    roll_mean = (
+        pd.Series(demand).rolling(window, min_periods=1).mean().to_numpy(dtype=float)
+    )
+
+    channels = [demand]
+    for feature in external_features:
+        channels.append(df[feature].to_numpy(dtype=float))
+    channels.append(tsl)
+    channels.append(roll_mean)
+
+    return np.column_stack(channels)
 
 
-def _generate_lag_features(df, column_name, n_lags=1):
+def _window_data(feature_frame, target_raw, window, forecast_horizon):
     """
-    Generate lag features for a given column in the dataframe.
+    Turn the (T, C) feature frame into CNN-ready temporal windows.
+
+    For each origin time t with a full window of history behind it and a full
+    forecast horizon ahead of it:
+      - X is the (C, window) slice covering rows [t-window+1 .. t]; the last axis
+        is genuine time, so a 1-D convolution slides over consecutive steps.
+      - y is the next forecast_horizon raw target values (rows t+1 .. t+horizon).
     """
-    df = df.copy()
-    for i in range(1, n_lags + 1):
-        df[f"{column_name}_Lag{i}"] = df[column_name].shift(i)
-    return df
+    n_rows, n_channels = feature_frame.shape
+    if n_rows < window + forecast_horizon:
+        return (
+            np.empty((0, n_channels, window), dtype=np.float32),
+            np.empty((0, forecast_horizon), dtype=np.float32),
+        )
 
+    # (n_rows - window + 1, C, window); windows[i, c, w] = feature_frame[i + w, c]
+    windows = sliding_window_view(feature_frame, window_shape=window, axis=0)
+    n_usable = n_rows - window - forecast_horizon + 1
+    X = windows[:n_usable]
 
-def _create_multistep_data(df, target_name, external_features, n_steps_lag, forecast_horizon):
-    """
-    Build multi-step training samples. For each possible row i (up to len(df)-forecast_horizon):
-      - The input vector is: [external features] + [lag features from row i]
-      - The target is the next forecast_horizon values of target_name (rows i+1 .. i+forecast_horizon).
-    """
-    X_list = []
-    y_list = []
-    for i in range(len(df) - forecast_horizon):
-        # Lags from current row i
-        lag_vals = df.iloc[i][[f"{target_name}_Lag{j}" for j in range(1, n_steps_lag + 1)]].values
+    # For origin i (last history row = i + window - 1), targets start at i + window.
+    horizon_windows = sliding_window_view(target_raw, window_shape=forecast_horizon)
+    y = horizon_windows[window : window + n_usable]
 
-        # External features from current row i (if any)
-        ext_vals = df.iloc[i][external_features].values if external_features else []
-
-        X_list.append(np.concatenate([ext_vals, lag_vals]))
-        # Next forecast_horizon steps for the target
-        y_seq = df.iloc[i+1 : i+forecast_horizon+1][target_name].values
-        y_list.append(y_seq)
-    return np.array(X_list), np.array(y_list)
+    return X.astype(np.float32), y.astype(np.float32)
 
 
 def _split_train_validation_sequences(X_all, y_all, forecast_horizon, val_fraction=0.1):
@@ -88,76 +118,83 @@ def _split_train_validation_sequences(X_all, y_all, forecast_horizon, val_fracti
     return X_train, y_train, X_val, y_val
 
 
+class _CausalConv1d(nn.Module):
+    """
+    Dilated causal 1-D convolution: left-pads the input so output step t only
+    depends on inputs at steps <= t (no leakage from the future).
+    """
+    def __init__(self, in_channels, out_channels, kernel_size, dilation):
+        super().__init__()
+        self.left_pad = (kernel_size - 1) * dilation
+        self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, dilation=dilation)
+
+    def forward(self, x):
+        x = F.pad(x, (self.left_pad, 0))
+        return self.conv(x)
+
+
 class CNNClassifier(nn.Module):
     """
-    PyTorch CNN model for classification (zero vs. nonzero)
+    Dilated-causal CNN that predicts zero vs. nonzero demand for each horizon step.
+
+    Outputs raw logits (no sigmoid) for use with BCEWithLogitsLoss; apply a sigmoid
+    at inference to recover probabilities.
     """
-    def __init__(self, n_features, forecast_horizon, dropout_rate=0.4):
-        super(CNNClassifier, self).__init__()
-        self.conv1 = nn.Conv1d(1, 64, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(64, 64, kernel_size=3, padding=1)
-        pooled_size = max(1, n_features // 2)
-        self.pool = nn.AdaptiveMaxPool1d(pooled_size)
+    def __init__(self, n_channels, forecast_horizon, dropout_rate=0.4):
+        super().__init__()
+        width = 64
+        self.block1 = _CausalConv1d(n_channels, width, kernel_size=3, dilation=1)
+        self.block2 = _CausalConv1d(width, width, kernel_size=3, dilation=2)
+        self.block3 = _CausalConv1d(width, width, kernel_size=3, dilation=4)
+        self.pool = nn.AdaptiveMaxPool1d(1)
         self.dropout = nn.Dropout(dropout_rate)
-        self.flatten = nn.Flatten()
-
-        flattened_size = 64 * pooled_size
-
-        self.fc1 = nn.Linear(flattened_size, 32)
+        self.fc1 = nn.Linear(width, 32)
         self.fc2 = nn.Linear(32, forecast_horizon)
         self.relu = nn.ReLU()
-        self.sigmoid = nn.Sigmoid()
-        
+
     def forward(self, x):
-        # Input shape: (batch, features, 1)
-        x = x.permute(0, 2, 1)  # PyTorch expects (batch, channels, features)
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.pool(x)
+        # x: (batch, channels, window)
+        x = self.relu(self.block1(x))
+        x = self.relu(self.block2(x))
+        x = self.relu(self.block3(x))
+        x = self.pool(x).squeeze(-1)  # global temporal pooling -> (batch, width)
         x = self.dropout(x)
-        x = self.flatten(x)
         x = self.relu(self.fc1(x))
-        x = self.sigmoid(self.fc2(x))
-        return x
+        return self.fc2(x)  # logits
 
 
 class CNNRegressor(nn.Module):
     """
-    PyTorch CNN model for regression
+    Dilated-causal CNN that predicts demand magnitude for each horizon step.
     """
-    def __init__(self, n_features, forecast_horizon, dropout_rate=0.2):
-        super(CNNRegressor, self).__init__()
-        self.conv1 = nn.Conv1d(1, 32, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(32, 32, kernel_size=3, padding=1)
-        pooled_size = max(1, n_features // 2)
-        self.pool = nn.AdaptiveMaxPool1d(pooled_size)
+    def __init__(self, n_channels, forecast_horizon, dropout_rate=0.2):
+        super().__init__()
+        width = 32
+        self.block1 = _CausalConv1d(n_channels, width, kernel_size=3, dilation=1)
+        self.block2 = _CausalConv1d(width, width, kernel_size=3, dilation=2)
+        self.block3 = _CausalConv1d(width, width, kernel_size=3, dilation=4)
+        self.pool = nn.AdaptiveMaxPool1d(1)
         self.dropout = nn.Dropout(dropout_rate)
-        self.flatten = nn.Flatten()
-
-        flattened_size = 32 * pooled_size
-
-        self.fc1 = nn.Linear(flattened_size, 46)
+        self.fc1 = nn.Linear(width, 46)
         self.fc2 = nn.Linear(46, forecast_horizon)
         self.relu = nn.ReLU()
-        
+
     def forward(self, x):
-        # Input shape: (batch, features, 1)
-        x = x.permute(0, 2, 1)  # PyTorch expects (batch, channels, features)
-        x = self.relu(self.conv1(x))
-        x = self.relu(self.conv2(x))
-        x = self.pool(x)
+        # x: (batch, channels, window)
+        x = self.relu(self.block1(x))
+        x = self.relu(self.block2(x))
+        x = self.relu(self.block3(x))
+        x = self.pool(x).squeeze(-1)
         x = self.dropout(x)
-        x = self.flatten(x)
         x = self.relu(self.fc1(x))
-        x = self.fc2(x)
-        return x
+        return self.fc2(x)
 
 
 class EarlyStopping:
     """
     PyTorch implementation of early stopping
     """
-    def __init__(self, patience=10, verbose=False, delta=0, path='checkpoint.pt'):
+    def __init__(self, patience=10, verbose=False, delta=0):
         self.patience = patience
         self.verbose = verbose
         self.counter = 0
@@ -166,11 +203,10 @@ class EarlyStopping:
         self.early_stop = False
         self.val_loss_min = np.inf  # Changed from np.Inf to np.inf for NumPy 2.0 compatibility
         self.delta = delta
-        self.path = path
-        
+
     def __call__(self, val_loss, model):
         score = -val_loss
-        
+
         if self.best_score is None:
             self.best_score = score
             self.save_checkpoint(val_loss, model)
@@ -184,7 +220,7 @@ class EarlyStopping:
             self.best_score = score
             self.save_checkpoint(val_loss, model)
             self.counter = 0
-            
+
     def save_checkpoint(self, val_loss, model):
         if self.verbose:
             print(f'Validation loss decreased ({self.val_loss_min:.6f} --> {val_loss:.6f}). Saving model...')
@@ -209,19 +245,25 @@ class UR2CUTE(BaseEstimator):
     """
     UR2CUTE: Using Repetitively 2 CNNs for Unsteady Timeseries Estimation (two-step/hurdle approach).
 
-    This estimator does direct multi-step forecasting with:
-      - A CNN-based classification model to predict zero vs. nonzero for each future step.
-      - A CNN-based regression model to predict the quantity (only trained on sequences that have
-        at least one nonzero step in the horizon).
+    This estimator does direct multi-step forecasting with two dilated-causal CNNs:
+      - A CNN classifier predicting zero vs. nonzero demand for each future step.
+      - A CNN regressor predicting the quantity (by default trained only on windows
+        whose horizon contains at least one nonzero step).
+
+    Both CNNs consume the same multichannel temporal window: the target history plus
+    any external covariates and two engineered intermittency channels (time since the
+    last nonzero demand and a causal rolling mean). Because the window's last axis is
+    genuine time, the dilated causal convolutions slide over consecutive time steps and
+    cover long inter-demand gaps cheaply.
 
     Parameters
     ----------
     n_steps_lag : int
-        Number of lag features to generate.
+        Length of the lookback window (number of past time steps each CNN sees).
     forecast_horizon : int
         Number of future steps to predict in one pass.
     external_features : list of str or None
-        Column names for external features (if any).
+        Column names for external covariates (if any).
     epochs : int
         Training epochs for both CNN models.
     batch_size : int
@@ -251,7 +293,7 @@ class UR2CUTE(BaseEstimator):
 
     def __init__(
         self,
-        n_steps_lag=3,
+        n_steps_lag=12,
         forecast_horizon=8,
         external_features=None,
         epochs=100,
@@ -268,7 +310,7 @@ class UR2CUTE(BaseEstimator):
     ):
         self.n_steps_lag = n_steps_lag
         self.forecast_horizon = forecast_horizon
-        self.external_features = external_features if external_features is not None else []
+        self.external_features = external_features
         self.epochs = epochs
         self.batch_size = batch_size
         self.threshold = threshold
@@ -281,19 +323,32 @@ class UR2CUTE(BaseEstimator):
         self.regressor_nonzero_only = regressor_nonzero_only
         self.verbose = verbose
 
-        # Set device (cuda if available, else cpu)
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-
         # Models will be created in fit()
         self.classifier_ = None
         self.regressor_ = None
-        # Scalers
-        self.scaler_X_ = None
-        self.scaler_y_ = None
+        # Per-channel input scaling (fit on training windows only)
+        self.channel_min_ = None
+        self.channel_max_ = None
+        # Target scaling (on the optional log1p scale)
+        self.y_min_ = None
+        self.y_max_ = None
+        self.use_log_target_ = None
         # Fitted dims
-        self.n_features_ = None
+        self.n_channels_ = None
         # Fitted threshold (for auto threshold computation)
         self.threshold_ = None
+
+    @property
+    def device(self):
+        """
+        Lazily-resolved compute device (cuda if available, else cpu).
+
+        Kept out of __init__ so that __init__ only assigns the estimator's
+        hyperparameters, per the sklearn convention required by clone()/get_params.
+        """
+        if getattr(self, "_device", None) is None:
+            self._device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        return self._device
 
     def _set_random_seeds(self):
         """
@@ -310,45 +365,79 @@ class UR2CUTE(BaseEstimator):
             torch.backends.cudnn.deterministic = True
             torch.backends.cudnn.benchmark = False
 
+    def _make_loader(self, X, y):
+        """Build a reproducible, seeded DataLoader for the given window tensors."""
+        X_tensor = torch.FloatTensor(X)
+        y_tensor = torch.FloatTensor(y)
+        dataset = TensorDataset(X_tensor, y_tensor)
+        generator = torch.Generator()
+        generator.manual_seed(self.random_seed)
+        return DataLoader(
+            dataset,
+            batch_size=self.batch_size,
+            shuffle=True,
+            generator=generator,
+        )
+
+    def _scale_X(self, X):
+        """Per-channel min-max scaling of (samples, channels, window) windows."""
+        value_range = self.channel_max_ - self.channel_min_
+        value_range = np.where(value_range == 0, 1.0, value_range)
+        return (X - self.channel_min_[None, :, None]) / value_range[None, :, None]
+
+    def _scale_y(self, y):
+        """Optional log1p transform followed by min-max scaling of the target."""
+        t = np.log1p(y) if self.use_log_target_ else y
+        value_range = self.y_max_ - self.y_min_
+        if value_range == 0:
+            value_range = 1.0
+        return (t - self.y_min_) / value_range
+
+    def _inverse_scale_y(self, y_scaled):
+        """Invert _scale_y back to the original target scale."""
+        value_range = self.y_max_ - self.y_min_
+        if value_range == 0:
+            value_range = 1.0
+        t = y_scaled * value_range + self.y_min_
+        return np.expm1(t) if self.use_log_target_ else t
+
     def _train_classifier(self, X_train, y_train, X_val, y_val):
         """
-        Train the classification model
+        Train the classification model with BCEWithLogitsLoss (with per-step
+        pos_weight to counter the heavy zero-class imbalance).
         """
-        # Convert numpy arrays to PyTorch tensors
-        X_train_tensor = torch.FloatTensor(X_train).to(self.device)
-        y_train_tensor = torch.FloatTensor(y_train).to(self.device)
+        train_loader = self._make_loader(X_train, y_train)
         X_val_tensor = torch.FloatTensor(X_val).to(self.device)
         y_val_tensor = torch.FloatTensor(y_val).to(self.device)
 
-        # Create dataset and dataloader
-        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-
         # Initialize model
         self.classifier_ = CNNClassifier(
-            n_features=self.n_features_,
+            n_channels=self.n_channels_,
             forecast_horizon=self.forecast_horizon,
             dropout_rate=self.dropout_classification
         ).to(self.device)
 
-        # Initialize optimizer and loss
+        # Per-horizon-step positive weight = (# negatives) / (# positives).
+        positives = y_train.sum(axis=0)
+        negatives = y_train.shape[0] - positives
+        pos_weight = negatives / np.clip(positives, 1.0, None)
+        pos_weight_tensor = torch.FloatTensor(pos_weight).to(self.device)
+
         optimizer = optim.Adam(self.classifier_.parameters(), lr=self.classification_lr)
-        criterion = nn.BCELoss()
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight_tensor)
 
-        early_stopping = EarlyStopping(
-            patience=self.patience,
-            verbose=self.verbose
-        )
+        early_stopping = EarlyStopping(patience=self.patience, verbose=self.verbose)
 
-        # Training loop
         for epoch in range(self.epochs):
             self.classifier_.train()
             train_loss = 0.0
 
             for X_batch, y_batch in train_loader:
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
                 optimizer.zero_grad()
-                outputs = self.classifier_(X_batch)
-                loss = criterion(outputs, y_batch)
+                logits = self.classifier_(X_batch)
+                loss = criterion(logits, y_batch)
                 loss.backward()
                 optimizer.step()
                 train_loss += loss.item() * X_batch.size(0)
@@ -358,11 +447,12 @@ class UR2CUTE(BaseEstimator):
             # Validation
             self.classifier_.eval()
             with torch.no_grad():
-                val_outputs = self.classifier_(X_val_tensor)
-                val_loss = criterion(val_outputs, y_val_tensor).item()
+                val_logits = self.classifier_(X_val_tensor)
+                val_loss = criterion(val_logits, y_val_tensor).item()
 
-                # Calculate accuracy
-                predicted = (val_outputs > 0.5).float()
+                # Report accuracy with the same threshold inference will use.
+                val_probs = torch.sigmoid(val_logits)
+                predicted = (val_probs > self.threshold_).float()
                 correct = (predicted == y_val_tensor).float().sum()
                 accuracy = correct / (y_val_tensor.size(0) * y_val_tensor.size(1))
 
@@ -370,7 +460,6 @@ class UR2CUTE(BaseEstimator):
                 print(f'Epoch {epoch+1}/{self.epochs}, Train Loss: {train_loss:.4f}, '
                       f'Val Loss: {val_loss:.4f}, Val Accuracy: {accuracy:.4f}')
 
-            # Early stopping
             early_stopping(val_loss, self.classifier_)
             if early_stopping.early_stop:
                 if self.verbose:
@@ -378,43 +467,35 @@ class UR2CUTE(BaseEstimator):
                 break
 
         early_stopping.restore_best_weights(self.classifier_, self.device)
-        
+
     def _train_regressor(self, X_train, y_train, X_val, y_val):
         """
-        Train the regression model
+        Train the regression model with a Huber (SmoothL1) loss, which is more
+        robust to the demand spikes typical of intermittent series than plain MSE.
         """
-        # Convert numpy arrays to PyTorch tensors
-        X_train_tensor = torch.FloatTensor(X_train).to(self.device)
-        y_train_tensor = torch.FloatTensor(y_train).to(self.device)
+        train_loader = self._make_loader(X_train, y_train)
         X_val_tensor = torch.FloatTensor(X_val).to(self.device)
         y_val_tensor = torch.FloatTensor(y_val).to(self.device)
 
-        # Create dataset and dataloader
-        train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
-        train_loader = DataLoader(train_dataset, batch_size=self.batch_size, shuffle=True)
-
         # Initialize model
         self.regressor_ = CNNRegressor(
-            n_features=self.n_features_,
+            n_channels=self.n_channels_,
             forecast_horizon=self.forecast_horizon,
             dropout_rate=self.dropout_regression
         ).to(self.device)
 
-        # Initialize optimizer and loss
         optimizer = optim.Adam(self.regressor_.parameters(), lr=self.regression_lr)
-        criterion = nn.MSELoss()
+        criterion = nn.SmoothL1Loss()
 
-        early_stopping = EarlyStopping(
-            patience=self.patience,
-            verbose=self.verbose
-        )
+        early_stopping = EarlyStopping(patience=self.patience, verbose=self.verbose)
 
-        # Training loop
         for epoch in range(self.epochs):
             self.regressor_.train()
             train_loss = 0.0
 
             for X_batch, y_batch in train_loader:
+                X_batch = X_batch.to(self.device)
+                y_batch = y_batch.to(self.device)
                 optimizer.zero_grad()
                 outputs = self.regressor_(X_batch)
                 loss = criterion(outputs, y_batch)
@@ -433,7 +514,6 @@ class UR2CUTE(BaseEstimator):
             if self.verbose:
                 print(f'Epoch {epoch+1}/{self.epochs}, Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}')
 
-            # Early stopping
             early_stopping(val_loss, self.regressor_)
             if early_stopping.early_stop:
                 if self.verbose:
@@ -521,7 +601,7 @@ class UR2CUTE(BaseEstimator):
         if df.empty:
             raise ValueError("Input DataFrame is empty")
 
-        # Check minimum data length for prediction (need at least n_steps_lag rows)
+        # Need at least a full lookback window to forecast from.
         min_required_length = self.n_steps_lag
         if len(df) < min_required_length:
             raise ValueError(
@@ -546,23 +626,23 @@ class UR2CUTE(BaseEstimator):
                 )
 
         # Check for NaN values in the last n_steps_lag rows of target column
-        # (these are the ones we'll use for lag features)
+        # (these are the ones we'll use for the lookback window).
         target_values = df[self.target_col_].tail(self.n_steps_lag)
         if target_values.isna().any():
             raise ValueError(
                 f"Target column '{self.target_col_}' contains NaN values in the last "
-                f"{self.n_steps_lag} rows needed for lag features. "
+                f"{self.n_steps_lag} rows needed for the lookback window. "
                 f"Please handle missing values before prediction."
             )
 
-        # Check for NaN values in the last row of external features
+        # Check for NaN values in the last window rows of external features
         if self.external_features:
-            last_row = df[self.external_features].iloc[-1]
-            if last_row.isna().any():
-                nan_features = last_row[last_row.isna()].index.tolist()
+            window_rows = df[self.external_features].tail(self.n_steps_lag)
+            if window_rows.isna().any().any():
+                nan_features = window_rows.columns[window_rows.isna().any()].tolist()
                 raise ValueError(
-                    f"External features {nan_features} contain NaN values in the last row. "
-                    f"Please handle missing values before prediction."
+                    f"External features {nan_features} contain NaN values in the last "
+                    f"{self.n_steps_lag} rows. Please handle missing values before prediction."
                 )
 
     def fit(self, df: pd.DataFrame, target_col: str) -> 'UR2CUTE':
@@ -572,13 +652,11 @@ class UR2CUTE(BaseEstimator):
         Expected columns:
           - `target_col`: The main target to forecast.
           - If external_features is not empty, those columns must exist in df.
-          - We'll generate lag features for `target_col`.
 
         Parameters
         ----------
         df : pd.DataFrame
-            Time-series data with at least the target column. Must be sorted by time in advance
-            (or you can ensure we do it here).
+            Time-series data with at least the target column, sorted by time.
         target_col : str
             The name of the column to forecast.
 
@@ -591,71 +669,59 @@ class UR2CUTE(BaseEstimator):
         ------
         ValueError
             If input data validation fails.
-        RuntimeError
-            If model training fails.
         """
         # Validate input data
         self._validate_input_data(df, target_col)
 
         self._set_random_seeds()
         self.target_col_ = target_col
-        # 1) Generate lag features & drop NaNs (work on copy to avoid modifying input)
-        df_copy = df.copy()
-        df_lagged = _generate_lag_features(df_copy, target_col, n_lags=self.n_steps_lag)
-        df_lagged.dropna(inplace=True)
-        df_lagged.reset_index(drop=True, inplace=True)
 
-        # 2) Create multi-step training data
-        X_all, y_all = _create_multistep_data(
-            df_lagged,
-            target_col,
-            self.external_features,
-            self.n_steps_lag,
-            self.forecast_horizon
+        # 1) Build the multichannel feature frame and window it into temporal samples.
+        feature_frame = _build_feature_frame(
+            df, target_col, self.external_features, self.n_steps_lag
         )
-        # shape: X_all -> (samples, features), y_all -> (samples, forecast_horizon)
+        target_raw = df[target_col].to_numpy(dtype=float)
+        X_all, y_all = _window_data(
+            feature_frame, target_raw, self.n_steps_lag, self.forecast_horizon
+        )
         n_sequences = X_all.shape[0]
         if n_sequences == 0:
             raise ValueError(
-                "Not enough usable sequences after generating lag features. "
+                "Not enough usable sequences after windowing. "
                 "Increase the size of your dataset or reduce n_steps_lag/forecast_horizon."
             )
 
         # Keep the validation tail chronologically separate from train targets.
         X_train_raw, y_train, X_val_raw, y_val = _split_train_validation_sequences(
-            X_all,
-            y_all,
-            self.forecast_horizon
+            X_all, y_all, self.forecast_horizon
         )
 
-        # 3) Scale inputs using training data statistics only
-        self.scaler_X_ = MinMaxScaler()
-        X_train_scaled = self.scaler_X_.fit_transform(X_train_raw)
-        X_val_scaled = self.scaler_X_.transform(X_val_raw)
+        # 2) Per-channel input scaling, fit on training windows only.
+        self.channel_min_ = X_train_raw.min(axis=(0, 2))
+        self.channel_max_ = X_train_raw.max(axis=(0, 2))
+        X_train = self._scale_X(X_train_raw)
+        X_val = self._scale_X(X_val_raw)
+        self.n_channels_ = X_train.shape[1]
 
-        self.scaler_y_ = MinMaxScaler()
-        y_train_flat = y_train.flatten().reshape(-1, 1)
-        self.scaler_y_.fit(y_train_flat)
-        y_train_scaled = self.scaler_y_.transform(y_train_flat).reshape(y_train.shape)
-        y_val_scaled = self.scaler_y_.transform(y_val.flatten().reshape(-1, 1)).reshape(y_val.shape)
+        # 3) Target scaling: log1p (only when non-negative) then min-max, train stats only.
+        self.use_log_target_ = bool(y_train.min() >= 0)
+        t_train = np.log1p(y_train) if self.use_log_target_ else y_train
+        self.y_min_ = float(t_train.min())
+        self.y_max_ = float(t_train.max())
+        y_train_scaled = self._scale_y(y_train)
+        y_val_scaled = self._scale_y(y_val)
 
-        # For CNN, we want (samples, features, 1)
-        X_train = X_train_scaled.reshape((X_train_scaled.shape[0], X_train_scaled.shape[1], 1))
-        X_val = X_val_scaled.reshape((X_val_scaled.shape[0], X_val_scaled.shape[1], 1))
-        self.n_features_ = X_train.shape[1]
-
-        # Auto threshold: if threshold is set to "auto", calculate it and store as threshold_
+        # Auto threshold: if threshold is "auto", derive an occurrence cutoff.
         if isinstance(self.threshold, str) and self.threshold.lower() == "auto":
             self.threshold_ = round(np.mean(y_train == 0), 2)
             if self.verbose:
                 print(f"Auto threshold set to: {self.threshold_}")
         else:
-            # Use the provided threshold value
             self.threshold_ = self.threshold
 
         # Classification target: zero vs. nonzero
-        y_train_binary = (y_train > 0).astype(float)  # shape: (samples, horizon)
-        y_val_binary = (y_val > 0).astype(float)
+        y_train_binary = (y_train > 0).astype(np.float32)
+        y_val_binary = (y_val > 0).astype(np.float32)
 
         # --------------------------
         # Train Classification Model
@@ -702,13 +768,13 @@ class UR2CUTE(BaseEstimator):
 
     def predict(self, df: pd.DataFrame) -> np.ndarray:
         """
-        Predict the next self.forecast_horizon steps from the *last* row of the input DataFrame.
+        Predict the next self.forecast_horizon steps from the *last* window of `df`.
 
-        We'll:
-          1) Generate lag features for df.
-          2) Take the final row (post-lag) as input.
-          3) Predict classification (zero vs. nonzero) for each horizon step.
-          4) Predict regression quantity, but only if classification > threshold.
+        Steps:
+          1) Build the multichannel feature frame for df.
+          2) Take the final lookback window as input.
+          3) Predict occurrence probability (sigmoid of the classifier logits) per step.
+          4) Predict quantity with the regressor, gated by the fitted threshold.
 
         Parameters
         ----------
@@ -723,7 +789,7 @@ class UR2CUTE(BaseEstimator):
         Raises
         ------
         RuntimeError
-            If the model has not been fitted yet or if prediction fails.
+            If the model has not been fitted yet.
         ValueError
             If input data validation fails.
         """
@@ -736,87 +802,43 @@ class UR2CUTE(BaseEstimator):
         # Validate input data
         self._validate_predict_data(df)
 
-        try:
-            target_col = self.target_col_
+        # Build the feature frame and take the final lookback window: (channels, window).
+        feature_frame = _build_feature_frame(
+            df, self.target_col_, self.external_features, self.n_steps_lag
+        )
+        window = feature_frame[-self.n_steps_lag:].T  # (channels, window)
+        x_input = window[np.newaxis, :, :].astype(np.float32)
+        x_input_scaled = self._scale_X(x_input)
 
-            # Build lag features (work on copy to avoid modifying input)
-            df_copy = df.copy()
-            df_lagged = _generate_lag_features(df_copy, target_col, n_lags=self.n_steps_lag)
-            df_lagged.dropna(inplace=True)
+        x_tensor = torch.FloatTensor(x_input_scaled).to(self.device)
 
-            # Take the final row to forecast from
-            last_idx = df_lagged.index[-1]
-            lag_vals = df_lagged.loc[last_idx, [f"{target_col}_Lag{j}" for j in range(1, self.n_steps_lag + 1)]].values
+        # Occurrence probabilities (sigmoid of logits) for each step.
+        self.classifier_.eval()
+        with torch.no_grad():
+            order_logits = self.classifier_(x_tensor)[0]
+            order_prob = torch.sigmoid(order_logits).cpu().numpy()
 
-            if self.external_features:
-                ext_vals = df_lagged.loc[last_idx, self.external_features].values
-            else:
-                ext_vals = []
+        # Quantity for each step.
+        self.regressor_.eval()
+        with torch.no_grad():
+            quantity_pred_scaled = self.regressor_(x_tensor)[0].cpu().numpy()
 
-            x_input = np.concatenate([ext_vals, lag_vals]).reshape(1, -1)
-            x_input_scaled = self.scaler_X_.transform(x_input)
-            x_input_reshaped = x_input_scaled.reshape((1, x_input_scaled.shape[1], 1))
+        quantity_pred = self._inverse_scale_y(quantity_pred_scaled)
 
-            # Convert to PyTorch tensor
-            x_tensor = torch.FloatTensor(x_input_reshaped).to(self.device)
+        # Combine using fitted threshold
+        final_preds = []
+        for prob, qty in zip(order_prob, quantity_pred):
+            pred = qty if prob > self.threshold_ else 0
+            final_preds.append(max(0, round(float(pred))))
 
-            # Classification (probabilities for each step)
-            self.classifier_.eval()
-            with torch.no_grad():
-                order_prob = self.classifier_(x_tensor)[0].cpu().numpy()
-
-            # Regression (quantity for each step)
-            self.regressor_.eval()
-            with torch.no_grad():
-                quantity_pred_scaled = self.regressor_(x_tensor)[0].cpu().numpy()
-
-            quantity_pred = self.scaler_y_.inverse_transform(quantity_pred_scaled.reshape(-1, 1)).flatten()
-
-            # Combine using fitted threshold
-            final_preds = []
-            for prob, qty in zip(order_prob, quantity_pred):
-                pred = qty if prob > self.threshold_ else 0
-                final_preds.append(max(0, round(pred)))
-
-            return np.array(final_preds)
-
-        except Exception as e:
-            raise RuntimeError(f"Prediction failed: {e}")
-
-    def get_params(self, deep=True):
-        """
-        For sklearn compatibility: returns the hyperparameters as a dict.
-        """
-        return {
-            'n_steps_lag': self.n_steps_lag,
-            'forecast_horizon': self.forecast_horizon,
-            'external_features': self.external_features,
-            'epochs': self.epochs,
-            'batch_size': self.batch_size,
-            'threshold': self.threshold,
-            'patience': self.patience,
-            'random_seed': self.random_seed,
-            'classification_lr': self.classification_lr,
-            'regression_lr': self.regression_lr,
-            'dropout_classification': self.dropout_classification,
-            'dropout_regression': self.dropout_regression,
-            'verbose': self.verbose
-        }
-
-    def set_params(self, **params):
-        """
-        For sklearn compatibility: sets hyperparameters from a dict.
-        """
-        for key, value in params.items():
-            setattr(self, key, value)
-        return self
+        return np.array(final_preds)
 
     def save_model(self, path: str) -> None:
         """
         Save the trained model to disk.
 
-        This saves both PyTorch models, scalers, and all fitted attributes
-        needed for prediction.
+        This saves both PyTorch models, scaling parameters, and all fitted
+        attributes needed for prediction.
 
         Parameters
         ----------
@@ -864,17 +886,20 @@ class UR2CUTE(BaseEstimator):
                 'regression_lr': self.regression_lr,
                 'dropout_classification': self.dropout_classification,
                 'dropout_regression': self.dropout_regression,
+                'regressor_nonzero_only': self.regressor_nonzero_only,
                 'verbose': self.verbose,
                 # Fitted attributes
                 'target_col_': self.target_col_,
-                'n_features_': self.n_features_,
+                'n_channels_': self.n_channels_,
                 'threshold_': self.threshold_,
+                'channel_min_': self.channel_min_,
+                'channel_max_': self.channel_max_,
+                'y_min_': self.y_min_,
+                'y_max_': self.y_max_,
+                'use_log_target_': self.use_log_target_,
                 # Model state dicts
                 'classifier_state_dict': classifier_state_cpu,
                 'regressor_state_dict': regressor_state_cpu,
-                # Scalers
-                'scaler_X_': self.scaler_X_,
-                'scaler_y_': self.scaler_y_,
                 # Device info
                 'device_type': self.device.type
             }
@@ -928,31 +953,36 @@ class UR2CUTE(BaseEstimator):
                 regression_lr=model_data['regression_lr'],
                 dropout_classification=model_data['dropout_classification'],
                 dropout_regression=model_data['dropout_regression'],
-                verbose=model_data.get('verbose', True)  # Default to True for backward compatibility
+                # Default to True for backward compatibility with models saved before
+                # these fields were persisted.
+                regressor_nonzero_only=model_data.get('regressor_nonzero_only', True),
+                verbose=model_data.get('verbose', True)
             )
 
             # Restore fitted attributes
             model.target_col_ = model_data['target_col_']
-            model.n_features_ = model_data['n_features_']
+            model.n_channels_ = model_data['n_channels_']
             model.threshold_ = model_data['threshold_']
-            model.scaler_X_ = model_data['scaler_X_']
-            model.scaler_y_ = model_data['scaler_y_']
+            model.channel_min_ = model_data['channel_min_']
+            model.channel_max_ = model_data['channel_max_']
+            model.y_min_ = model_data['y_min_']
+            model.y_max_ = model_data['y_max_']
+            model.use_log_target_ = model_data['use_log_target_']
 
             # Recreate models with correct architecture
             model.classifier_ = CNNClassifier(
-                n_features=model.n_features_,
+                n_channels=model.n_channels_,
                 forecast_horizon=model.forecast_horizon,
                 dropout_rate=model.dropout_classification
             ).to(model.device)
 
             model.regressor_ = CNNRegressor(
-                n_features=model.n_features_,
+                n_channels=model.n_channels_,
                 forecast_horizon=model.forecast_horizon,
                 dropout_rate=model.dropout_regression
             ).to(model.device)
 
-            # Load model weights with device mapping for GPU→CPU compatibility
-            # Convert state dicts to current device to handle GPU→CPU or CPU→GPU transfers
+            # Load model weights with device mapping for GPU<->CPU compatibility
             classifier_state = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v
                               for k, v in model_data['classifier_state_dict'].items()}
             regressor_state = {k: v.to(model.device) if isinstance(v, torch.Tensor) else v

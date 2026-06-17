@@ -8,8 +8,8 @@ import torch
 
 from UR2CUTE import UR2CUTE
 from UR2CUTE.model import (
-    _create_multistep_data,
-    _generate_lag_features,
+    _build_feature_frame,
+    _window_data,
     _split_train_validation_sequences,
 )
 
@@ -271,11 +271,13 @@ def test_regressor_nonzero_only_default_is_true():
 def test_validation_split_keeps_targets_disjoint():
     """Validation windows should not reuse target periods seen in training."""
     df = pd.DataFrame({"target": list(range(1, 21))})
-    lagged = _generate_lag_features(df, "target", n_lags=2).dropna().reset_index(drop=True)
-    _, y_all = _create_multistep_data(lagged, "target", [], 2, 4)
+    feature_frame = _build_feature_frame(df, "target", [], 2)
+    X_all, y_all = _window_data(
+        feature_frame, df["target"].to_numpy(dtype=float), 2, 4
+    )
 
     _, y_train, _, y_val = _split_train_validation_sequences(
-        np.zeros((len(y_all), 1)),
+        X_all,
         y_all,
         forecast_horizon=4,
     )
@@ -284,3 +286,72 @@ def test_validation_split_keeps_targets_disjoint():
     val_targets = set(y_val.flatten().tolist())
 
     assert train_targets.isdisjoint(val_targets)
+
+
+def test_feature_frame_channel_layout():
+    """Channels are [target, *external_features, time-since-last, rolling-mean]."""
+    df = pd.DataFrame(
+        {
+            "target": [0, 0, 3, 0, 0, 5, 0],
+            "promo": [0, 1, 0, 0, 1, 0, 0],
+        }
+    )
+    frame = _build_feature_frame(df, "target", ["promo"], window=3)
+
+    # 1 target + 1 external + 2 engineered channels
+    assert frame.shape == (len(df), 4)
+    # Channel 0 is the raw target.
+    np.testing.assert_array_equal(frame[:, 0], df["target"].to_numpy(dtype=float))
+    # Channel 1 is the external feature.
+    np.testing.assert_array_equal(frame[:, 1], df["promo"].to_numpy(dtype=float))
+    # Channel 2 is time-since-last-nonzero: resets to 0 on demand, counts up otherwise.
+    np.testing.assert_array_equal(frame[:, 2], [1, 2, 0, 1, 2, 0, 1])
+
+
+def test_window_shape_and_causality():
+    """Windows are (samples, channels, window) with no future leakage into X."""
+    df = pd.DataFrame({"target": list(range(20))})
+    frame = _build_feature_frame(df, "target", [], window=4)
+    X, y = _window_data(frame, df["target"].to_numpy(dtype=float), window=4, forecast_horizon=3)
+
+    assert X.ndim == 3
+    assert X.shape[1] == frame.shape[1]  # channels
+    assert X.shape[2] == 4  # window length
+    assert y.shape == (X.shape[0], 3)
+    # For the first sample, history target channel is rows 0..3 and the
+    # forecast targets are the next three rows (4, 5, 6) — strictly future.
+    np.testing.assert_array_equal(X[0, 0, :], [0, 1, 2, 3])
+    np.testing.assert_array_equal(y[0], [4, 5, 6])
+
+
+def test_log_target_skipped_for_negative_values():
+    """log1p must be skipped when the target can be negative (no NaNs)."""
+    df = pd.DataFrame(
+        {"target": [0, 0, -2, 0, 3, 0, 0, -1, 0, 4, 0, 0, 5, 0, 0, 2, 0, 0, 3, 0]}
+    )
+    model = UR2CUTE(n_steps_lag=4, forecast_horizon=3, epochs=2, verbose=False)
+    model.fit(df, target_col="target")
+
+    assert model.use_log_target_ is False
+    assert not np.isnan(model.predict(df)).any()
+
+
+def test_learns_periodic_spike_pattern():
+    """On a clean period-4 pattern the model should recover the spike timing."""
+    n = 240
+    df = pd.DataFrame({"target": [5 if i % 4 == 0 else 0 for i in range(n)]})
+    model = UR2CUTE(
+        n_steps_lag=12,
+        forecast_horizon=8,
+        epochs=40,
+        batch_size=16,
+        patience=8,
+        threshold=0.5,
+        verbose=False,
+    )
+    model.fit(df, target_col="target")
+    preds = model.predict(df)
+
+    # Some steps fire and some stay zero — it has not collapsed to all-zero or all-spike.
+    assert (preds > 0).any()
+    assert (preds == 0).any()
