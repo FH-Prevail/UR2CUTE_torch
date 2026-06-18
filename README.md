@@ -16,6 +16,19 @@ Migration notes:
 - **Models saved with 1.x cannot be loaded in 2.0** — retrain and re-save.
 - The default `n_steps_lag` changed from `3` to `12` (it is now a lookback window, not a count of lag columns). Set it explicitly to pin behaviour.
 
+## What's New in 2.2
+
+Better out-of-the-box defaults, informed by benchmarking on real intermittent data:
+
+- **`threshold` now defaults to `"balanced"`** (was `0.5`). It tunes the occurrence
+  cutoff on the validation split to drive forecast bias toward zero — the previous
+  fixed/`"auto"` cutoffs systematically under-forecast. Adds no training cost.
+- **`verbose` now defaults to `False`** (was `True`), which suits fitting many series
+  in a loop. Pass `verbose=True` to restore per-epoch logging.
+
+Both are behaviour changes for code relying on the old defaults; set the parameters
+explicitly to pin previous behaviour.
+
 ## Overview
 
 Intermittent demand is dominated by long zero stretches punctuated by irregular spikes. Traditional statistical models struggle to capture both the timing and the size of those bursts. UR2CUTE tackles the problem with a hurdle-style architecture:
@@ -100,7 +113,7 @@ model = UR2CUTE(
     n_steps_lag=12,
     forecast_horizon=4,
     external_features=["promo", "price"],
-    threshold="auto",
+    threshold="balanced",
 )
 model.fit(data, target_col="target")
 print(model.predict(data))
@@ -115,7 +128,7 @@ print(model.predict(data))
 | `external_features` | Optional list of column names used as exogenous inputs. | `None` |
 | `epochs` | Training epochs for both CNN models. | 100 |
 | `batch_size` | Training batch size. | 32 |
-| `threshold` | Occurrence cutoff: a float, `"auto"` (fraction of zeros), or `"balanced"` (tuned on validation to minimize forecast bias). | 0.5 |
+| `threshold` | Occurrence cutoff: a float, `"auto"` (fraction of zeros), or `"balanced"` (tuned on validation to minimize forecast bias). | `"balanced"` |
 | `patience` | Early stopping patience (epochs). | 10 |
 | `random_seed` | Global random seed applied to NumPy, Python, and PyTorch. | 42 |
 | `classification_lr` | Learning rate for the classifier. | 0.0021 |
@@ -123,7 +136,7 @@ print(model.predict(data))
 | `dropout_classification` | Dropout applied inside the classifier. | 0.4 |
 | `dropout_regression` | Dropout applied inside the regressor. | 0.2 |
 | `regressor_nonzero_only` | When `True`, the regressor is trained only on sequences where the forecast horizon contains at least one non-zero value. Set to `False` to train the regressor on all sequences. | `True` |
-| `verbose` | Enables progress output and early-stopping logs. | `True` |
+| `verbose` | Enables progress output and early-stopping logs. | `False` |
 
 ## Usage Patterns
 
@@ -143,10 +156,13 @@ model = UR2CUTE(external_features=covariates)
 model.fit(df, "target")
 ```
 
-### Silent Training
+### Progress Logging
+
+Training is silent by default; pass `verbose=True` for per-epoch loss and
+early-stopping logs.
 
 ```python
-model = UR2CUTE(verbose=False)
+model = UR2CUTE(verbose=True)
 model.fit(df, "target")
 ```
 

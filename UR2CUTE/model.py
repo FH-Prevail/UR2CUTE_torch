@@ -270,9 +270,10 @@ class UR2CUTE(BaseEstimator):
         Batch size for training.
     threshold : float, "auto", or "balanced"
         Probability threshold for classifying zero vs. nonzero demand.
-        If "auto", uses the proportion of zeros in the training data (simple, but
-        tends to over-gate and under-forecast). If "balanced", tunes the cutoff on
-        the validation split to drive the forecast bias toward zero.
+        Default "balanced" tunes the cutoff on the validation split to drive the
+        forecast bias toward zero. "auto" uses the proportion of zeros in the
+        training data (simple, but tends to over-gate and under-forecast). A float
+        is used as a fixed cutoff.
     patience : int
         Patience for EarlyStopping.
     random_seed : int
@@ -290,7 +291,8 @@ class UR2CUTE(BaseEstimator):
         contains at least one non-zero value. Set to False to train the regressor on all
         sequences regardless of demand occurrence.
     verbose : bool
-        Whether to print training progress. Default is True.
+        Whether to print training progress. Default is False (quiet), which suits
+        fitting many series in a loop.
     """
 
     def __init__(
@@ -300,7 +302,7 @@ class UR2CUTE(BaseEstimator):
         external_features=None,
         epochs=100,
         batch_size=32,
-        threshold=0.5,
+        threshold="balanced",
         patience=10,
         random_seed=42,
         classification_lr=0.0021,
@@ -308,7 +310,7 @@ class UR2CUTE(BaseEstimator):
         dropout_classification=0.4,
         dropout_regression=0.2,
         regressor_nonzero_only=True,
-        verbose=True
+        verbose=False
     ):
         self.n_steps_lag = n_steps_lag
         self.forecast_horizon = forecast_horizon
