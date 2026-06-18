@@ -268,9 +268,11 @@ class UR2CUTE(BaseEstimator):
         Training epochs for both CNN models.
     batch_size : int
         Batch size for training.
-    threshold : float or "auto"
+    threshold : float, "auto", or "balanced"
         Probability threshold for classifying zero vs. nonzero demand.
-        If "auto", computes threshold based on proportion of zeros in training data.
+        If "auto", uses the proportion of zeros in the training data (simple, but
+        tends to over-gate and under-forecast). If "balanced", tunes the cutoff on
+        the validation split to drive the forecast bias toward zero.
     patience : int
         Patience for EarlyStopping.
     random_seed : int
@@ -335,7 +337,7 @@ class UR2CUTE(BaseEstimator):
         self.use_log_target_ = None
         # Fitted dims
         self.n_channels_ = None
-        # Fitted threshold (for auto threshold computation)
+        # Fitted threshold (resolved auto/balanced/fixed cutoff)
         self.threshold_ = None
 
     @property
@@ -400,6 +402,34 @@ class UR2CUTE(BaseEstimator):
             value_range = 1.0
         t = y_scaled * value_range + self.y_min_
         return np.expm1(t) if self.use_log_target_ else t
+
+    def _regressor_magnitude(self, X):
+        """Back-transformed regression magnitudes for windows X."""
+        xt = torch.FloatTensor(X).to(self.device)
+        self.regressor_.eval()
+        with torch.no_grad():
+            scaled = np.clip(self.regressor_(xt).cpu().numpy(), 0.0, 1.2)
+        return self._inverse_scale_y(scaled)
+
+    def _tune_threshold_balanced(self, X_val, y_val_raw):
+        """Pick the occurrence threshold that drives validation bias toward zero
+        (ties broken by lower MAE). Cheap: the threshold only gates predict()."""
+        xt = torch.FloatTensor(X_val).to(self.device)
+        self.classifier_.eval()
+        with torch.no_grad():
+            prob = torch.sigmoid(self.classifier_(xt)).cpu().numpy()
+        qty = self._regressor_magnitude(X_val)
+
+        best_t, best_obj, best_mae = 0.5, np.inf, np.inf
+        for t in np.round(np.arange(0.05, 0.96, 0.05), 2):
+            preds = np.where(prob > t, np.round(qty), 0.0)
+            preds = np.clip(preds, 0.0, None)
+            err = preds - y_val_raw
+            obj = abs(float(np.mean(err)))
+            mae = float(np.mean(np.abs(err)))
+            if obj < best_obj - 1e-9 or (abs(obj - best_obj) <= 1e-9 and mae < best_mae):
+                best_t, best_obj, best_mae = float(t), obj, mae
+        return round(best_t, 2)
 
     def _train_classifier(self, X_train, y_train, X_val, y_val):
         """
@@ -711,11 +741,20 @@ class UR2CUTE(BaseEstimator):
         y_train_scaled = self._scale_y(y_train)
         y_val_scaled = self._scale_y(y_val)
 
-        # Auto threshold: if threshold is "auto", derive an occurrence cutoff.
-        if isinstance(self.threshold, str) and self.threshold.lower() == "auto":
+        # Occurrence threshold.
+        #   "auto"     -> fraction of zeros (simple, but tends to over-gate).
+        #   "balanced" -> tuned on the validation set after both CNNs are trained
+        #                 to drive the forecast bias toward zero (set below); use a
+        #                 neutral placeholder for now so the classifier's reported
+        #                 validation accuracy is well-defined.
+        #   float      -> used as-is.
+        thr_mode = self.threshold.lower() if isinstance(self.threshold, str) else None
+        if thr_mode == "auto":
             self.threshold_ = round(np.mean(y_train == 0), 2)
             if self.verbose:
                 print(f"Auto threshold set to: {self.threshold_}")
+        elif thr_mode == "balanced":
+            self.threshold_ = 0.5
         else:
             self.threshold_ = self.threshold
 
@@ -763,6 +802,12 @@ class UR2CUTE(BaseEstimator):
             y_val_reg = y_val_scaled
 
         self._train_regressor(X_train_reg, y_train_reg, X_val_reg, y_val_reg)
+
+        # "balanced" threshold: tune on validation to push the forecast bias toward 0.
+        if thr_mode == "balanced":
+            self.threshold_ = self._tune_threshold_balanced(X_val, y_val)
+            if self.verbose:
+                print(f"Balanced threshold set to: {self.threshold_}")
 
         return self
 

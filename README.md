@@ -35,7 +35,7 @@ The estimator follows the scikit-learn API, includes thorough input validation, 
 - Multichannel temporal windows: target history, optional external covariates, and engineered intermittency channels (time-since-last-demand, causal rolling mean).
 - Dilated causal convolutions (TCN-style) so each CNN slides over a genuine time axis and cheaply covers long inter-demand gaps.
 - Customizable hyperparameters (epochs, batch size, independent learning rates, dropout).
-- Auto-threshold mode that derives an occurrence cutoff from the training set.
+- Occurrence threshold modes: a fixed value, `"auto"` (fraction of zeros), or `"balanced"` (tuned on validation to drive the forecast bias toward zero).
 - Early stopping that restores the best weights, kept in memory during training.
 - Reproducible results through explicit random seed management.
 - Model persistence through `save_model` and `load_model`.
@@ -115,7 +115,7 @@ print(model.predict(data))
 | `external_features` | Optional list of column names used as exogenous inputs. | `None` |
 | `epochs` | Training epochs for both CNN models. | 100 |
 | `batch_size` | Training batch size. | 32 |
-| `threshold` | Manual probability threshold or `"auto"` to derive from training data. | 0.5 |
+| `threshold` | Occurrence cutoff: a float, `"auto"` (fraction of zeros), or `"balanced"` (tuned on validation to minimize forecast bias). | 0.5 |
 | `patience` | Early stopping patience (epochs). | 10 |
 | `random_seed` | Global random seed applied to NumPy, Python, and PyTorch. | 42 |
 | `classification_lr` | Learning rate for the classifier. | 0.0021 |

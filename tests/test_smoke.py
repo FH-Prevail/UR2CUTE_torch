@@ -336,6 +336,33 @@ def test_log_target_skipped_for_negative_values():
     assert not np.isnan(model.predict(df)).any()
 
 
+def test_balanced_threshold_tunes_valid_cutoff():
+    """'balanced' threshold resolves to a valid cutoff and round-trips."""
+    rng = np.random.RandomState(1)
+    n = 160
+    demand = (rng.rand(n) < 0.35) * rng.randint(1, 40, size=n)
+    df = pd.DataFrame({"target": demand.astype(float)})
+    model = UR2CUTE(n_steps_lag=12, forecast_horizon=6, epochs=25,
+                    threshold="balanced", verbose=False)
+    model.fit(df, target_col="target")
+
+    assert 0.0 < model.threshold_ < 1.0
+    preds = model.predict(df)
+    assert preds.shape == (model.forecast_horizon,)
+    assert np.isfinite(preds).all() and (preds >= 0).all()
+
+    path = str(tmp_path_fallback("balanced.pkl"))
+    model.save_model(path)
+    loaded = UR2CUTE.load_model(path)
+    assert loaded.threshold_ == model.threshold_
+    assert (loaded.predict(df) == preds).all()
+
+
+def tmp_path_fallback(name):
+    import tempfile, os
+    return os.path.join(tempfile.gettempdir(), name)
+
+
 def test_large_magnitude_predictions_stay_bounded():
     """Large-magnitude intermittent demand must not explode through expm1."""
     rng = np.random.RandomState(0)
