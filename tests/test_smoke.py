@@ -336,6 +336,21 @@ def test_log_target_skipped_for_negative_values():
     assert not np.isnan(model.predict(df)).any()
 
 
+def test_large_magnitude_predictions_stay_bounded():
+    """Large-magnitude intermittent demand must not explode through expm1."""
+    rng = np.random.RandomState(0)
+    n = 120
+    demand = (rng.rand(n) < 0.3) * rng.randint(100, 5000, size=n)
+    df = pd.DataFrame({"target": demand.astype(float)})
+    model = UR2CUTE(n_steps_lag=12, forecast_horizon=6, epochs=20, verbose=False)
+    model.fit(df, target_col="target")
+    preds = model.predict(df)
+
+    assert np.isfinite(preds).all()
+    # No forecast should exceed a small margin above the largest observed demand.
+    assert preds.max() <= demand.max() * 3
+
+
 def test_learns_periodic_spike_pattern():
     """On a clean period-4 pattern the model should recover the spike timing."""
     n = 240

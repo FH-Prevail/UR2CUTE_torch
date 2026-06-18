@@ -823,6 +823,12 @@ class UR2CUTE(BaseEstimator):
         with torch.no_grad():
             quantity_pred_scaled = self.regressor_(x_tensor)[0].cpu().numpy()
 
+        # The regression head is unbounded, so on large-magnitude or log1p-scaled
+        # targets a runaway prediction can explode through the expm1 inverse. Clamp
+        # to a small margin above the training target range before inverting: normal
+        # forecasts (well inside [0, 1] scaled) are untouched, but absurd magnitudes
+        # are prevented.
+        quantity_pred_scaled = np.clip(quantity_pred_scaled, 0.0, 1.2)
         quantity_pred = self._inverse_scale_y(quantity_pred_scaled)
 
         # Combine using fitted threshold
