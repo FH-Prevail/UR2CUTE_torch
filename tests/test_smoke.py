@@ -336,7 +336,40 @@ def test_log_target_skipped_for_negative_values():
     assert not np.isnan(model.predict(df)).any()
 
 
-def test_balanced_threshold_tunes_valid_cutoff():
+def test_predict_components_and_continuous_output():
+    """return_components exposes prob/quantity; integer_output=False stays float."""
+    df = pd.DataFrame({"target": [0, 0, 5, 0, 7, 0, 0, 3, 0, 0] * 3})
+    model = UR2CUTE(n_steps_lag=6, forecast_horizon=4, epochs=5, verbose=False)
+    model.fit(df, target_col="target")
+
+    out = model.predict(df, return_components=True)
+    assert set(out) == {"forecast", "probability", "quantity"}
+    assert out["probability"].shape == (4,)
+    assert ((out["probability"] >= 0) & (out["probability"] <= 1)).all()
+    assert (out["quantity"] >= 0).all()
+    # Gating consistency: forecast is quantity where prob clears the threshold, else 0.
+    expected = np.where(out["probability"] > model.threshold_,
+                        np.round(out["quantity"]), 0)
+    np.testing.assert_array_equal(out["forecast"], expected.astype(int))
+
+    cont = model.predict(df, integer_output=False)
+    assert cont.dtype == float
+    assert (cont >= 0).all()
+
+
+def test_backtest_rolling_origin():
+    """backtest returns per-window rows and a summary of intermittent metrics."""
+    df = pd.DataFrame({"target": [0, 0, 5, 0, 7, 0, 0, 3, 0, 0] * 4})
+    model = UR2CUTE(n_steps_lag=6, forecast_horizon=4, epochs=5, verbose=False)
+    model.fit(df, target_col="target")
+
+    result = model.backtest(df, n_windows=3)
+    assert len(result["windows"]) == 3
+    assert set(result["summary"]) == {"mase", "rmsse", "mae", "rmse", "bias"}
+    assert np.isfinite(result["summary"]["mae"])
+
+
+def test_balanced_threshold_tunes_valid_cutoff(tmp_path):
     """'balanced' threshold resolves to a valid cutoff and round-trips."""
     rng = np.random.RandomState(1)
     n = 160
@@ -351,16 +384,11 @@ def test_balanced_threshold_tunes_valid_cutoff():
     assert preds.shape == (model.forecast_horizon,)
     assert np.isfinite(preds).all() and (preds >= 0).all()
 
-    path = str(tmp_path_fallback("balanced.pkl"))
+    path = str(tmp_path / "balanced.pkl")
     model.save_model(path)
     loaded = UR2CUTE.load_model(path)
     assert loaded.threshold_ == model.threshold_
     assert (loaded.predict(df) == preds).all()
-
-
-def tmp_path_fallback(name):
-    import tempfile, os
-    return os.path.join(tempfile.gettempdir(), name)
 
 
 def test_large_magnitude_predictions_stay_bounded():

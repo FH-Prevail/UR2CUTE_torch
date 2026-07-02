@@ -2,6 +2,7 @@ import os
 import random
 import pickle
 import copy
+import warnings
 from typing import List, Optional, Union
 import numpy as np
 import pandas as pd
@@ -12,7 +13,7 @@ import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
 from numpy.lib.stride_tricks import sliding_window_view
 
-from sklearn.base import BaseEstimator
+from sklearn.base import BaseEstimator, clone
 
 
 # Internal column names for engineered intermittent-demand channels.
@@ -96,16 +97,25 @@ def _split_train_validation_sequences(X_all, y_all, forecast_horizon, val_fracti
     If the dataset is too small to support a leakage-free split, fall back to
     using the full dataset for both train and validation.
     """
+    def _degraded():
+        warnings.warn(
+            "Series too short for a leakage-free train/validation split; using the "
+            "full dataset for both. Early stopping and the 'balanced' threshold "
+            "will be tuned on training data and may overfit.",
+            UserWarning,
+        )
+        return X_all, y_all, X_all.copy(), y_all.copy()
+
     n_sequences = X_all.shape[0]
     if n_sequences < 2:
-        return X_all, y_all, X_all.copy(), y_all.copy()
+        return _degraded()
 
     n_val = max(1, int(np.ceil(n_sequences * val_fraction)))
     val_start = n_sequences - n_val
     train_end = val_start - forecast_horizon + 1
 
     if train_end <= 0 or val_start >= n_sequences:
-        return X_all, y_all, X_all.copy(), y_all.copy()
+        return _degraded()
 
     X_train = X_all[:train_end]
     y_train = y_all[:train_end]
@@ -113,7 +123,7 @@ def _split_train_validation_sequences(X_all, y_all, forecast_horizon, val_fracti
     y_val = y_all[val_start:]
 
     if len(X_train) == 0 or len(X_val) == 0:
-        return X_all, y_all, X_all.copy(), y_all.copy()
+        return _degraded()
 
     return X_train, y_train, X_val, y_val
 
@@ -384,10 +394,17 @@ class UR2CUTE(BaseEstimator):
         )
 
     def _scale_X(self, X):
-        """Per-channel min-max scaling of (samples, channels, window) windows."""
+        """Per-channel min-max scaling of (samples, channels, window) windows.
+
+        Scaled values are clipped to [-1, 2]: training windows always land in
+        [0, 1] (they define the min/max), so this only bounds inference inputs
+        that fall outside the training range (e.g. a record demand spike or a
+        longer zero-gap than ever seen), preventing blind extrapolation.
+        """
         value_range = self.channel_max_ - self.channel_min_
         value_range = np.where(value_range == 0, 1.0, value_range)
-        return (X - self.channel_min_[None, :, None]) / value_range[None, :, None]
+        scaled = (X - self.channel_min_[None, :, None]) / value_range[None, :, None]
+        return np.clip(scaled, -1.0, 2.0)
 
     def _scale_y(self, y):
         """Optional log1p transform followed by min-max scaling of the target."""
@@ -813,7 +830,8 @@ class UR2CUTE(BaseEstimator):
 
         return self
 
-    def predict(self, df: pd.DataFrame) -> np.ndarray:
+    def predict(self, df: pd.DataFrame, return_components: bool = False,
+                integer_output: bool = True):
         """
         Predict the next self.forecast_horizon steps from the *last* window of `df`.
 
@@ -827,11 +845,20 @@ class UR2CUTE(BaseEstimator):
         ----------
         df : pd.DataFrame
             The time-series DataFrame (sorted by time). Must have the same columns as in fit().
+        return_components : bool
+            If True, also return the ungated model outputs: a dict with keys
+            "forecast", "probability" (occurrence probability per step, before the
+            threshold), and "quantity" (regressor magnitude per step, before gating
+            and rounding). Useful for service-level decisions and custom gating.
+        integer_output : bool
+            If True (default), forecasts are rounded to non-negative integers
+            (count demand). Set False for continuous demand (kg, liters, ...).
 
         Returns
         -------
         forecast : np.ndarray of shape (forecast_horizon,)
-            The integer predictions for each step in the horizon.
+            The gated predictions for each step in the horizon, or the components
+            dict if return_components=True.
 
         Raises
         ------
@@ -865,26 +892,102 @@ class UR2CUTE(BaseEstimator):
             order_logits = self.classifier_(x_tensor)[0]
             order_prob = torch.sigmoid(order_logits).cpu().numpy()
 
-        # Quantity for each step.
-        self.regressor_.eval()
-        with torch.no_grad():
-            quantity_pred_scaled = self.regressor_(x_tensor)[0].cpu().numpy()
-
-        # The regression head is unbounded, so on large-magnitude or log1p-scaled
-        # targets a runaway prediction can explode through the expm1 inverse. Clamp
-        # to a small margin above the training target range before inverting: normal
-        # forecasts (well inside [0, 1] scaled) are untouched, but absurd magnitudes
-        # are prevented.
-        quantity_pred_scaled = np.clip(quantity_pred_scaled, 0.0, 1.2)
-        quantity_pred = self._inverse_scale_y(quantity_pred_scaled)
+        # Quantity for each step (clamped before the expm1 inverse; see
+        # _regressor_magnitude for the rationale).
+        quantity_pred = self._regressor_magnitude(x_input_scaled)[0]
 
         # Combine using fitted threshold
-        final_preds = []
-        for prob, qty in zip(order_prob, quantity_pred):
-            pred = qty if prob > self.threshold_ else 0
-            final_preds.append(max(0, round(float(pred))))
+        gated = np.where(order_prob > self.threshold_, quantity_pred, 0.0)
+        gated = np.clip(gated, 0.0, None)
+        if integer_output:
+            forecast = np.round(gated).astype(int)
+        else:
+            forecast = gated.astype(float)
 
-        return np.array(final_preds)
+        if return_components:
+            return {
+                "forecast": forecast,
+                "probability": order_prob,
+                "quantity": quantity_pred,
+            }
+        return forecast
+
+    def backtest(self, df: pd.DataFrame, target_col: Optional[str] = None,
+                 n_windows: int = 5, stride: int = 1, refit: bool = False) -> dict:
+        """
+        Rolling-origin evaluation over the tail of `df` with intermittent-demand
+        metrics (MASE, RMSSE, MAE, RMSE, bias).
+
+        For each of `n_windows` origins (spaced `stride` steps apart, ending at the
+        last full horizon in `df`), forecast the next `forecast_horizon` steps from
+        the history before the origin and score against the actuals.
+
+        Parameters
+        ----------
+        df : pd.DataFrame
+            Full time-series DataFrame (sorted by time), same columns as fit().
+        target_col : str or None
+            Target column. Defaults to the column used in fit().
+        n_windows : int
+            Number of rolling origins to evaluate.
+        stride : int
+            Step between consecutive origins.
+        refit : bool
+            If True, refit a fresh clone of this estimator on each history slice
+            (honest but slow). If False (default), reuse the already-fitted model;
+            note that windows overlapping the data it was fit on are partially
+            in-sample.
+
+        Returns
+        -------
+        result : dict
+            {"windows": DataFrame with one row per origin (origin, mase, rmsse,
+            mae, rmse, bias), "summary": dict of the mean of each metric}.
+        """
+        target_col = target_col if target_col is not None else getattr(self, "target_col_", None)
+        if target_col is None:
+            raise ValueError("target_col is required when the model is not fitted yet.")
+        if not refit and (self.classifier_ is None or self.regressor_ is None):
+            raise RuntimeError("Model not fitted. Fit first or pass refit=True.")
+
+        H = self.forecast_horizon
+        min_history = self.n_steps_lag + (H + 1 if refit else 0)
+        origins = [len(df) - H - i * stride for i in range(n_windows)][::-1]
+        origins = [o for o in origins if o >= min_history]
+        if not origins:
+            raise ValueError(
+                f"Not enough data to backtest: need at least "
+                f"{min_history + H} rows, got {len(df)}."
+            )
+
+        rows = []
+        for origin in origins:
+            history = df.iloc[:origin]
+            actual = df[target_col].iloc[origin:origin + H].to_numpy(dtype=float)
+            model = clone(self).fit(history, target_col) if refit else self
+            preds = np.asarray(model.predict(history), dtype=float)
+            err = preds - actual
+
+            hist_y = history[target_col].to_numpy(dtype=float)
+            diffs = np.abs(np.diff(hist_y))
+            mae_scale = diffs.mean() if diffs.size and diffs.mean() > 0 else np.nan
+            sq = np.diff(hist_y) ** 2
+            rmse_scale = np.sqrt(sq.mean()) if sq.size and sq.mean() > 0 else np.nan
+
+            mae = float(np.abs(err).mean())
+            rmse = float(np.sqrt((err ** 2).mean()))
+            rows.append({
+                "origin": origin,
+                "mase": mae / mae_scale if mae_scale == mae_scale else np.nan,
+                "rmsse": rmse / rmse_scale if rmse_scale == rmse_scale else np.nan,
+                "mae": mae,
+                "rmse": rmse,
+                "bias": float(err.mean()),
+            })
+
+        windows = pd.DataFrame(rows)
+        summary = windows.drop(columns="origin").mean().to_dict()
+        return {"windows": windows, "summary": summary}
 
     def save_model(self, path: str) -> None:
         """
@@ -926,6 +1029,8 @@ class UR2CUTE(BaseEstimator):
             }
 
             model_data = {
+                # Save-format version for forward-compatible migrations.
+                'format_version': 1,
                 # Hyperparameters
                 'n_steps_lag': self.n_steps_lag,
                 'forecast_horizon': self.forecast_horizon,
@@ -958,7 +1063,7 @@ class UR2CUTE(BaseEstimator):
             }
 
             with open(path, 'wb') as f:
-                pickle.dump(model_data, f)
+                pickle.dump(model_data, f, protocol=pickle.HIGHEST_PROTOCOL)
 
         except Exception as e:
             raise RuntimeError(f"Failed to save model: {e}")
@@ -967,6 +1072,10 @@ class UR2CUTE(BaseEstimator):
     def load_model(cls, path: str) -> 'UR2CUTE':
         """
         Load a trained model from disk.
+
+        .. warning::
+            This unpickles the file, which can execute arbitrary code. Only load
+            model files from sources you trust.
 
         Parameters
         ----------
@@ -1006,10 +1115,9 @@ class UR2CUTE(BaseEstimator):
                 regression_lr=model_data['regression_lr'],
                 dropout_classification=model_data['dropout_classification'],
                 dropout_regression=model_data['dropout_regression'],
-                # Default to True for backward compatibility with models saved before
-                # these fields were persisted.
+                # Defaults for models saved before these fields were persisted.
                 regressor_nonzero_only=model_data.get('regressor_nonzero_only', True),
-                verbose=model_data.get('verbose', True)
+                verbose=model_data.get('verbose', False)
             )
 
             # Restore fitted attributes

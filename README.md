@@ -16,6 +16,26 @@ Migration notes:
 - **Models saved with 1.x cannot be loaded in 2.0** — retrain and re-save.
 - The default `n_steps_lag` changed from `3` to `12` (it is now a lookback window, not a count of lag columns). Set it explicitly to pin behaviour.
 
+## What's New in 2.3
+
+Quality-of-life and evaluation release — no modeling changes:
+
+- **`backtest(df, n_windows=5)`** — built-in rolling-origin evaluation with the
+  standard intermittent-demand metrics (MASE, RMSSE, MAE, RMSE, bias), per window
+  and summarized. Pass `refit=True` for fully out-of-sample refits per origin.
+- **`predict(df, return_components=True)`** — exposes the ungated occurrence
+  probability and quantity per horizon step, for service-level decisions or
+  custom gating.
+- **`predict(df, integer_output=False)`** — continuous (non-rounded) forecasts for
+  fractional demand (kg, liters, ...).
+- Robustness: inference inputs outside the training range (record spikes, longer
+  zero-gaps than ever seen) are now clipped instead of extrapolated blindly; a
+  warning is raised when the series is too short for a leakage-free
+  train/validation split (early stopping and the balanced threshold then tune on
+  training data).
+- Model files now embed a `format_version` for forward-compatible migrations, and
+  `load_model` documents the standard pickle security caveat.
+
 ## What's New in 2.2
 
 Better out-of-the-box defaults, informed by benchmarking on real intermittent data:
@@ -52,6 +72,7 @@ The estimator follows the scikit-learn API, includes thorough input validation, 
 - Early stopping that restores the best weights, kept in memory during training.
 - Reproducible results through explicit random seed management.
 - Model persistence through `save_model` and `load_model`.
+- Built-in rolling-origin `backtest` with intermittent-demand metrics (MASE, RMSSE, bias), and access to ungated forecast components via `predict(..., return_components=True)`.
 - Complete type hints and packaged type information (`py.typed`).
 
 ## Dependencies
@@ -164,6 +185,31 @@ early-stopping logs.
 ```python
 model = UR2CUTE(verbose=True)
 model.fit(df, "target")
+```
+
+### Forecast Components (probability & quantity)
+
+```python
+out = model.predict(df, return_components=True)
+out["forecast"]     # gated forecast (same as plain predict)
+out["probability"]  # P(demand > 0) per horizon step, before the threshold
+out["quantity"]     # regressor magnitude per step, before gating/rounding
+```
+
+### Continuous Demand
+
+```python
+preds = model.predict(df, integer_output=False)  # no rounding (kg, liters, ...)
+```
+
+### Rolling-Origin Backtest
+
+```python
+result = model.backtest(df, n_windows=5)      # reuse the fitted model (fast)
+print(result["summary"])                       # mean MASE, RMSSE, MAE, RMSE, bias
+print(result["windows"])                       # one row per origin
+
+result = model.backtest(df, n_windows=5, refit=True)  # refit per origin (honest, slow)
 ```
 
 ### Model Persistence
