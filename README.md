@@ -2,20 +2,6 @@
 
 Using Repetitively 2 CNNs for Unsteady Timeseries Estimation. UR2CUTE is a dual-stage, PyTorch powered model dedicated to intermittent demand forecasting. A classifier estimates demand occurrence while a regressor predicts magnitude, allowing the library to focus on the sparse structure typical of slow-moving inventory.
 
-## What's New in 2.0
-
-Version 2.0.0 keeps the two-CNN hurdle design but overhauls how the networks see the data. **This is a breaking release.**
-
-- **Multichannel temporal windows** replace the old flat lag vector. Each CNN now receives `(channels, window)` where the window axis is genuine time: target history, optional covariates, and engineered intermittency channels (time-since-last-demand, causal rolling mean).
-- **Dilated causal convolutions (TCN-style)** so the convolutions slide over consecutive time steps and cover long inter-demand gaps cheaply.
-- **Better training objectives:** `BCEWithLogitsLoss` with per-step `pos_weight` for the classifier (heavy zero-class imbalance) and a Huber (SmoothL1) loss for the regressor (robust to spikes).
-- **Smarter scaling:** per-channel min-max plus an automatic `log1p` transform on non-negative targets.
-
-Migration notes:
-
-- **Models saved with 1.x cannot be loaded in 2.0** — retrain and re-save.
-- The default `n_steps_lag` changed from `3` to `12` (it is now a lookback window, not a count of lag columns). Set it explicitly to pin behaviour.
-
 ## What's New in 2.3
 
 Quality-of-life and evaluation release — no modeling changes:
@@ -35,19 +21,6 @@ Quality-of-life and evaluation release — no modeling changes:
   training data).
 - Model files now embed a `format_version` for forward-compatible migrations, and
   `load_model` documents the standard pickle security caveat.
-
-## What's New in 2.2
-
-Better out-of-the-box defaults, informed by benchmarking on real intermittent data:
-
-- **`threshold` now defaults to `"balanced"`** (was `0.5`). It tunes the occurrence
-  cutoff on the validation split to drive forecast bias toward zero — the previous
-  fixed/`"auto"` cutoffs systematically under-forecast. Adds no training cost.
-- **`verbose` now defaults to `False`** (was `True`), which suits fitting many series
-  in a loop. Pass `verbose=True` to restore per-epoch logging.
-
-Both are behaviour changes for code relying on the old defaults; set the parameters
-explicitly to pin previous behaviour.
 
 ## Overview
 
@@ -233,6 +206,37 @@ preds = loaded.predict(new_df)
 ## Performance
 
 Internal benchmarks show UR2CUTE outperforming Croston, AutoARIMA, Prophet, gradient boosted trees, and random forests on sparse demand series, especially in MAE% and RMSE%. Improvements stem from the dedicated occurrence model, the multichannel temporal window with engineered intermittency signals, and the dilated causal filters tuned to each dataset.
+
+## Changelog
+
+### 2.2 — better defaults
+
+Informed by benchmarking on real intermittent data:
+
+- **`threshold` now defaults to `"balanced"`** (was `0.5`). It tunes the occurrence
+  cutoff on the validation split to drive forecast bias toward zero — the previous
+  fixed/`"auto"` cutoffs systematically under-forecast. Adds no training cost.
+- **`verbose` now defaults to `False`** (was `True`), which suits fitting many series
+  in a loop. Pass `verbose=True` to restore per-epoch logging.
+
+Both are behaviour changes for code relying on the old defaults; set the parameters
+explicitly to pin previous behaviour.
+
+### 2.1 — bias-aware threshold
+
+- Added `threshold="balanced"`: tunes the occurrence cutoff on the validation split
+  to reduce the systematic under-forecast of fixed/`"auto"` cutoffs.
+
+### 2.0 — architecture overhaul (breaking)
+
+Version 2.0.0 keeps the two-CNN hurdle design but overhauls how the networks see the data:
+
+- **Multichannel temporal windows** replace the old flat lag vector. Each CNN receives `(channels, window)` where the window axis is genuine time: target history, optional covariates, and engineered intermittency channels (time-since-last-demand, causal rolling mean).
+- **Dilated causal convolutions (TCN-style)** so the convolutions slide over consecutive time steps and cover long inter-demand gaps cheaply.
+- **Better training objectives:** `BCEWithLogitsLoss` with per-step `pos_weight` for the classifier and a Huber (SmoothL1) loss for the regressor.
+- **Smarter scaling:** per-channel min-max plus an automatic `log1p` transform on non-negative targets.
+
+Migration notes: models saved with 1.x cannot be loaded in 2.x — retrain and re-save. The default `n_steps_lag` changed from `3` to `12` (it is now a lookback window, not a count of lag columns).
 
 ## Citation
 
